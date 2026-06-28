@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package orders.v1;
+
+import "buf/validate/validate.proto";
+
+option go_package = "github.com/mathis-sperlich/gearbox/example/gen/ordersv1;ordersv1";
+
+// One RPC per workflow action; requests carry the target order(s) plus the
+// action's payload, validated by protovalidate before the handler runs.
+service OrdersService {
+  rpc Pay(PayRequest) returns (PayResponse);
+  rpc Ship(ShipRequest) returns (ShipResponse);
+  // Cancel takes one order (id) or a batch (ids) — exactly one must be set.
+  // A batch runs in a single all-or-nothing transaction (gearbox.RunAll).
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+}
+
+message PayRequest {
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  string payment_ref = 2 [(buf.validate.field).string.min_len = 1];
+}
+message PayResponse {
+  int64 total_cents = 1;
+  string currency = 2;
+}
+
+message ShipRequest {
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  string tracking_code = 2 [(buf.validate.field).string.min_len = 1];
+}
+message ShipResponse {
+  string tracking_code = 1;
+}
+
+// Selector picks the target entities for a bulk-capable action: one order (id)
+// or a batch (ids), exactly one set. Declared once, embedded per request; its
+// generated getters satisfy gearbox.Selector — no gearbox proto import.
+message Selector {
+  option (buf.validate.message).oneof = {
+    fields: ["id", "ids"]
+    required: true
+  };
+  string id = 1;
+  repeated string ids = 2;
+}
+
+message CancelRequest {
+  Selector selector = 1 [(buf.validate.field).required = true];
+  string reason = 2 [(buf.validate.field).string.min_len = 1];
+}
+message CancelResponse {
+  int32 cancelled = 1;
+  int64 refunded_cents = 2;
+}
