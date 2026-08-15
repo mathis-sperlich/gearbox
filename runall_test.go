@@ -106,6 +106,51 @@ func TestRunAll_BadSelectorHardFails(t *testing.T) {
 	}
 }
 
+func TestRunAllInTx_ComposesOnCallerTxWithoutGate(t *testing.T) {
+	m := map[string]*fixtureEntity{
+		"a": {ID: "a", Status: fxDraft},
+		"b": {ID: "b", Status: fxDraft},
+	}
+	a := publishOn(mapFixture(m))
+	var authzCalls int
+	authz := gearbox.Authorize(func(context.Context, gearbox.Principal, gearbox.ActionDescriptor, []string) error {
+		authzCalls++
+		return nil
+	})
+	runner := txRunner(nilTx{})
+	eng := engineOver(runner, gearbox.Config{Authz: authz})
+
+	out, err := gearbox.RunAllInTx(context.Background(), nilTx{}, eng, a, gearbox.IDs{"b", "a"}, struct{}{})
+	if err != nil || len(out) != 2 {
+		t.Fatalf("out=%v err=%v, want 2 results", out, err)
+	}
+	if authzCalls != 0 {
+		t.Fatal("RunAllInTx must not consult Authorize")
+	}
+	if runner.called != 0 {
+		t.Fatal("RunAllInTx must not open its own tx")
+	}
+	if m["a"].Status != fxReady || m["b"].Status != fxReady {
+		t.Fatalf("statuses = %q/%q, want ready/ready", m["a"].Status, m["b"].Status)
+	}
+}
+
+func TestIDs_SelectorAdapter(t *testing.T) {
+	m := map[string]*fixtureEntity{"a": {ID: "a", Status: fxDraft}}
+	a := publishOn(mapFixture(m))
+	eng, _ := allowAllEngine(nilTx{})
+
+	if _, err := gearbox.RunAll(context.Background(), eng, nil, a, gearbox.IDs{"a"}, struct{}{}); err != nil {
+		t.Fatalf("RunAll with IDs: %v", err)
+	}
+	if m["a"].Status != fxReady {
+		t.Fatalf("status = %q, want ready", m["a"].Status)
+	}
+	if _, err := gearbox.RunAll(context.Background(), eng, nil, a, gearbox.IDs{}, struct{}{}); !errors.Is(err, gearbox.ErrBadSelector) {
+		t.Fatalf("empty IDs: err = %v, want ErrBadSelector", err)
+	}
+}
+
 func TestRunAll_AuthorizesOnceWithAllIDs(t *testing.T) {
 	m := map[string]*fixtureEntity{
 		"a": {ID: "a", Status: fxDraft},

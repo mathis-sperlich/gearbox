@@ -46,19 +46,19 @@ type Selector interface {
 	GetIds() []string
 }
 
-// RunAll runs one action over every entity sel selects, in a single
-// all-or-nothing transaction: authorize once, sort ids (consistent lock order
-// across overlapping batches), then lock → check → body → save per entity. Any
-// failure rolls the whole batch back. A single-id selector is a batch of one.
-// Typically sel is a field of req: RunAll(ctx, eng, p, action, req.GetSelector(), req).
-func RunAll[T any, S ~string, Req any, Resp any](
-	ctx context.Context,
-	eng *Engine,
-	p Principal,
-	action *Action[T, S, Req, Resp],
-	sel Selector,
-	req Req,
-) ([]Resp, error) {
+// IDs adapts a plain id slice to Selector, for callers whose ids don't come
+// from a Selector-shaped message: RunAll(ctx, eng, p, action, gearbox.IDs(ids), req).
+type IDs []string
+
+// GetId implements Selector; a batch never selects by single id.
+func (IDs) GetId() string { return "" }
+
+// GetIds implements Selector.
+func (ids IDs) GetIds() []string { return ids }
+
+// selectorIDs normalizes a Selector into the sorted, deduplicated id batch:
+// nil, empty, or both-id-and-ids selectors hard-fail with ErrBadSelector.
+func selectorIDs(sel Selector) ([]string, error) {
 	if sel == nil {
 		return nil, fmt.Errorf("%w: nil selector", ErrBadSelector)
 	}
@@ -73,23 +73,63 @@ func RunAll[T any, S ~string, Req any, Resp any](
 		return nil, fmt.Errorf("%w: selects no entity (set id or ids)", ErrBadSelector)
 	}
 	slices.Sort(ids)
-	ids = slices.Compact(ids)
+	return slices.Compact(ids), nil
+}
+
+// RunAll runs one action over every entity sel selects, in a single
+// all-or-nothing transaction: authorize once, sort ids (consistent lock order
+// across overlapping batches), then lock → check → body → save per entity. Any
+// failure rolls the whole batch back. A single-id selector is a batch of one.
+// Typically sel is a field of req: RunAll(ctx, eng, p, action, req.GetSelector(), req).
+func RunAll[T any, S ~string, Req any, Resp any](
+	ctx context.Context,
+	eng *Engine,
+	p Principal,
+	action *Action[T, S, Req, Resp],
+	sel Selector,
+	req Req,
+) ([]Resp, error) {
+	ids, err := selectorIDs(sel)
+	if err != nil {
+		return nil, err
+	}
 	if err := eng.Authorize(ctx, p, action, ids); err != nil {
 		return nil, err
 	}
-	out := make([]Resp, 0, len(ids))
-	err := eng.Tx(ctx, p, func(tx pgx.Tx) error {
-		for _, id := range ids {
-			r, err := RunInTx(ctx, tx, eng, action, id, req)
-			if err != nil {
-				return err
-			}
-			out = append(out, r)
-		}
-		return nil
+	var out []Resp
+	err = eng.Tx(ctx, p, func(tx pgx.Tx) error {
+		r, err := RunAllInTx(ctx, tx, eng, action, sel, req)
+		out = r
+		return err
 	})
 	if err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// RunAllInTx is RunAll inside a transaction the caller owns: same sorted,
+// deduplicated, all-or-nothing batch, minus the authorization gate (gate with
+// eng.Authorize yourself, or you're a trusted system caller).
+func RunAllInTx[T any, S ~string, Req any, Resp any](
+	ctx context.Context,
+	tx pgx.Tx,
+	eng *Engine,
+	action *Action[T, S, Req, Resp],
+	sel Selector,
+	req Req,
+) ([]Resp, error) {
+	ids, err := selectorIDs(sel)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Resp, 0, len(ids))
+	for _, id := range ids {
+		r, err := RunInTx(ctx, tx, eng, action, id, req)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, nil
 }

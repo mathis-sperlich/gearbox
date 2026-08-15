@@ -58,21 +58,36 @@ type Config struct {
 	// Authz gates Run. Nil allows everything — set it (or rely on database-layer
 	// RLS) before exposing the engine to untrusted callers.
 	Authz Authorize
-	// Source records transition provenance for an audit log. Optional.
+	// Source records transition provenance for an audit log. Audit attribution
+	// is ON by default: a nil Source gets GUCSourceWriter{GUC: "gearbox.source"}
+	// (one tx-local set_config per run — harmless without triggers; see the
+	// audit subpackage for the matching DDL). Set NoSource to opt out.
 	Source SourceWriter
+	// NoSource disables source attribution entirely (overrides Source).
+	NoSource bool
 	// RequestID extracts a correlation ID from the context for Source. Optional.
 	RequestID RequestIDFunc
 }
+
+// DefaultGUC is the transaction-local setting Source attribution writes to
+// when no SourceWriter is configured.
+const DefaultGUC = "gearbox.source"
 
 // NewEngine builds an Engine. Panics if Tx is nil.
 func NewEngine(cfg Config) *Engine {
 	if cfg.Tx == nil {
 		panic("gearbox: NewEngine requires a non-nil Tx (TxRunner)")
 	}
+	src := cfg.Source
+	if cfg.NoSource {
+		src = nil
+	} else if src == nil {
+		src = GUCSourceWriter{GUC: DefaultGUC}
+	}
 	return &Engine{
 		tx:        cfg.Tx,
 		authz:     cfg.Authz,
-		source:    cfg.Source,
+		source:    src,
 		requestID: cfg.RequestID,
 	}
 }

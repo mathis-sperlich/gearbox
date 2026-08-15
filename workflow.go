@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 )
 
 // WorkflowConfig declares a state machine for one (entity, status column) pair.
@@ -83,6 +84,26 @@ func (wf *Workflow[T, S]) RegistryKey() string {
 	return wf.Entity + "/" + wf.WorkflowName
 }
 
+// entitySet records every entity name that passed through NewWorkflow, so the
+// audit subpackage can emit DDL for "every registered entity" by default.
+var (
+	entitiesMu sync.Mutex
+	entitySet  = map[string]bool{}
+)
+
+// Entities returns the entity (table) name of every workflow registered via
+// NewWorkflow, sorted and de-duplicated.
+func Entities() []string {
+	entitiesMu.Lock()
+	defer entitiesMu.Unlock()
+	out := make([]string, 0, len(entitySet))
+	for e := range entitySet {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // NewWorkflow builds a Workflow. Misconfiguration (non-struct entity, missing
 // status field, derived Load/Save without db tags or an id column) panics here,
 // at boot, not at request time.
@@ -90,6 +111,9 @@ func NewWorkflow[T any, S ~string](cfg WorkflowConfig[T, S]) *Workflow[T, S] {
 	if cfg.Entity == "" {
 		panic("gearbox: WorkflowConfig.Entity is required")
 	}
+	entitiesMu.Lock()
+	entitySet[cfg.Entity] = true
+	entitiesMu.Unlock()
 	RegisterTable[T](cfg.Entity) // T → table name for the CRUD helpers
 	initial := make([]string, len(cfg.Initial))
 	for i, s := range cfg.Initial {
