@@ -15,7 +15,7 @@ type capRow struct {
 	N    int    `db:"n"`
 }
 
-// capExec records the last Exec; Query/QueryRow are unused by Update/Delete.
+// capExec records the last Exec; Query/QueryRow are unused by Update.
 type capExec struct {
 	sql  string
 	args []any
@@ -52,12 +52,12 @@ func TestMetaOf(t *testing.T) {
 }
 
 func TestWhereClause(t *testing.T) {
-	w, args := whereClause([]Predicate{Eq("a", 1), Gt("b", 2), In("c", []int{3, 4})}, 1)
-	want := ` where "a" = $1 and "b" > $2 and "c" = any($3)`
+	w, args := whereClause([]Predicate{Eq("a", 1), Eq("b", 2)}, 1)
+	want := ` where "a" = $1 and "b" = $2`
 	if w != want {
 		t.Errorf("where = %q, want %q", w, want)
 	}
-	if len(args) != 3 || args[0] != 1 || args[1] != 2 {
+	if len(args) != 2 || args[0] != 1 || args[1] != 2 {
 		t.Errorf("args = %v", args)
 	}
 }
@@ -76,11 +76,5 @@ func TestUpdateSQL(t *testing.T) {
 	}
 	if len(c.args) != 3 || c.args[0] != "ada" || c.args[1] != 7 || c.args[2] != "x" {
 		t.Fatalf("args = %v", c.args)
-	}
-}
-
-func TestDeleteNeedsPredicate(t *testing.T) {
-	if _, err := Delete[capRow](context.Background(), &capExec{}); err == nil {
-		t.Fatal("expected error deleting with no predicate")
 	}
 }

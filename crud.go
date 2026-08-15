@@ -45,25 +45,16 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 // Tx is the escape hatch for the rare caller that needs the raw transaction.
 func (d *DB) Tx() pgx.Tx { return d.tx }
 
-// Predicate is one "column op value" filter. Build with Eq/Ne/Gt/Gte/Lt/Lte/In and
-// pass to Get/List/Update/Delete; multiple preds are AND-ed.
+// Predicate is one "column = value" filter. Build with Eq and pass to
+// Get/GetForUpdate/Update; multiple preds are AND-ed. This deliberately stops
+// at equality — anything richer is a real query and belongs in your own SQL
+// layer (sqlc, raw pgx) on db.Tx().
 type Predicate struct {
 	col string
-	op  string
 	val any
 }
 
-func Eq(col string, v any) Predicate  { return Predicate{col, "=", v} }
-func Ne(col string, v any) Predicate  { return Predicate{col, "<>", v} }
-func Gt(col string, v any) Predicate  { return Predicate{col, ">", v} }
-func Gte(col string, v any) Predicate { return Predicate{col, ">=", v} }
-func Lt(col string, v any) Predicate  { return Predicate{col, "<", v} }
-func Lte(col string, v any) Predicate { return Predicate{col, "<=", v} }
-
-// In matches any element of a slice: `col = any($n)`.
-func In(col string, vs any) Predicate { return Predicate{col, opIn, vs} }
-
-const opIn = "= any"
+func Eq(col string, v any) Predicate { return Predicate{col, v} }
 
 // whereClause renders preds into " where ..." with placeholders numbered from
 // startArg, returning the matching args in order.
@@ -78,12 +69,7 @@ func whereClause(preds []Predicate, startArg int) (string, []any) {
 		if i > 0 {
 			b.WriteString(" and ")
 		}
-		n := startArg + i
-		if p.op == opIn {
-			fmt.Fprintf(&b, "%s = any($%d)", quoteIdent(p.col), n)
-		} else {
-			fmt.Fprintf(&b, "%s %s $%d", quoteIdent(p.col), p.op, n)
-		}
+		fmt.Fprintf(&b, "%s = $%d", quoteIdent(p.col), startArg+i)
 		args = append(args, p.val)
 	}
 	return b.String(), args
@@ -117,17 +103,6 @@ func getOne[T any](ctx context.Context, db Execer, lock bool, preds []Predicate)
 		return zero, fmt.Errorf("%w: %s", ErrEntityNotFound, m.table)
 	}
 	return v, err
-}
-
-// List returns every row matching preds (no preds = the whole table).
-func List[T any](ctx context.Context, db Execer, preds ...Predicate) ([]T, error) {
-	m := metaOf(typeOf[T]())
-	where, args := whereClause(preds, 1)
-	rows, err := db.Query(ctx, "select * from "+quoteIdent(m.table)+where, args...)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowToStructByName[T])
 }
 
 // Insert writes row and returns it re-read (RETURNING *), so DB-generated values
@@ -181,18 +156,6 @@ func Update[T any](ctx context.Context, db Execer, row T, preds ...Predicate) (i
 	where, wargs := whereClause(preds, len(args)+1)
 	args = append(args, wargs...)
 	tag, err := db.Exec(ctx, "update "+quoteIdent(m.table)+" set "+strings.Join(sets, ", ")+where, args...)
-	return tag.RowsAffected(), err
-}
-
-// Delete removes every row matching preds. At least one pred is required — it
-// refuses to truncate a table by accident. Returns rows affected.
-func Delete[T any](ctx context.Context, db Execer, preds ...Predicate) (int64, error) {
-	if len(preds) == 0 {
-		return 0, fmt.Errorf("gearbox: Delete needs at least one predicate")
-	}
-	m := metaOf(typeOf[T]())
-	where, args := whereClause(preds, 1)
-	tag, err := db.Exec(ctx, "delete from "+quoteIdent(m.table)+where, args...)
 	return tag.RowsAffected(), err
 }
 

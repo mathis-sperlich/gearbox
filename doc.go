@@ -14,8 +14,8 @@
 //	                      primitive (bulk loops, mixed actions, background jobs).
 //
 // Bodies receive a *DB (a tx that cannot commit or roll back) and read/write via
-// the generic CRUD helpers (Get/GetForUpdate/List/Insert/Update/Delete) over
-// db-tagged structs, dropping to sqlc or raw pgx when a query earns it.
+// the row helpers (Get/GetForUpdate/Insert/Update, Eq predicates) over db-tagged
+// structs, dropping to sqlc or raw pgx via db.Tx() when a query earns it.
 //
 // Bring your own auth: a TxRunner opens the tx with whatever tenancy the host
 // wants (plain pool via PoolTx, or an RLS-bound tx), and Authorize is one func

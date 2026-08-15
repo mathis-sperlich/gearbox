@@ -42,8 +42,9 @@ resps, err := gearbox.RunAll(ctx, eng, principal, Pay, selector, req)    // batc
 resp, err := gearbox.RunInTx(ctx, tx, eng, Pay, id, req)                 // compose in your own tx
 ```
 
-Inside a body, `Get` / `GetForUpdate` / `List` / `Insert` / `Update` /
-`Delete` read and write related rows in the same transaction. Auth is one
+Inside a body, `Get` / `GetForUpdate` / `Insert` / `Update` read and write
+related rows in the same transaction; richer queries drop to your own SQL
+layer (sqlc, raw pgx) on `db.Tx()`. Auth is one
 lambda the consumer defines — or omits if not wanted (`Config.Authz`).
 Transport is defined by the consumer, but gearbox was built to work with
 Connect-RPC and buf.validate: the [example](example/) is a complete
