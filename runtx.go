@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -110,7 +112,9 @@ func RunAll[T any, S ~string, Req any, Resp any](
 
 // RunAllInTx is RunAll inside a transaction the caller owns: same sorted,
 // deduplicated, all-or-nothing batch, minus the authorization gate (gate with
-// eng.Authorize yourself, or you're a trusted system caller).
+// eng.Authorize yourself, or you're a trusted system caller). The batch pays
+// two fixed statements — one source write, one multi-row FOR UPDATE in sorted
+// id order — instead of two per entity.
 func RunAllInTx[T any, S ~string, Req any, Resp any](
 	ctx context.Context,
 	tx pgx.Tx,
@@ -123,15 +127,51 @@ func RunAllInTx[T any, S ~string, Req any, Resp any](
 	if err != nil {
 		return nil, err
 	}
+	wf := action.wf
+	// Source attribution — identical for every entity in the batch, set once.
+	if err := eng.writeSource(ctx, tx, wf.Entity, action.name); err != nil {
+		return nil, err
+	}
+	// One FOR UPDATE over the whole batch, ordered so overlapping batches lock
+	// in a consistent order. An IN list of individual placeholders keeps the
+	// comparison typed by the id column (uuid, text, …) and index-friendly.
+	if _, err := tx.Exec(ctx, batchLockSQL(wf.Entity, len(ids)), anySlice(ids)...); err != nil {
+		return nil, fmt.Errorf("gearbox: lock %s batch: %w", wf.Entity, err)
+	}
 	out := make([]Resp, 0, len(ids))
 	for _, id := range ids {
-		r, err := RunInTx(ctx, tx, eng, action, id, req)
+		r, err := runInTx(ctx, tx, eng, action, id, req, true)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// batchLockSQL builds the batch FOR UPDATE for n ids.
+func batchLockSQL(entity string, n int) string {
+	var b strings.Builder
+	b.WriteString("select 1 from ")
+	b.WriteString(quoteIdent(entity))
+	b.WriteString(" where id in (")
+	for i := 1; i <= n; i++ {
+		if i > 1 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('$')
+		b.WriteString(strconv.Itoa(i))
+	}
+	b.WriteString(") order by id for update")
+	return b.String()
+}
+
+func anySlice(ids []string) []any {
+	out := make([]any, len(ids))
+	for i, id := range ids {
+		out[i] = id
+	}
+	return out
 }
 
 // RunInTx runs one action inside a transaction the caller owns — the
@@ -147,17 +187,33 @@ func RunInTx[T any, S ~string, Req any, Resp any](
 	id string,
 	req Req,
 ) (Resp, error) {
+	return runInTx(ctx, tx, eng, action, id, req, false)
+}
+
+// runInTx is the per-entity cycle. batched skips source attribution and the
+// row lock — RunAllInTx has already done both for the whole batch.
+func runInTx[T any, S ~string, Req any, Resp any](
+	ctx context.Context,
+	tx pgx.Tx,
+	eng *Engine,
+	action *Action[T, S, Req, Resp],
+	id string,
+	req Req,
+	batched bool,
+) (Resp, error) {
 	var resp Resp
 	wf := action.wf
 	db := NewDB(tx)
 
-	// 0. Source attribution.
-	if err := eng.writeSource(ctx, tx, wf.Entity, action.name); err != nil {
-		return resp, err
-	}
-	// 1. FOR UPDATE on the entity row.
-	if _, err := tx.Exec(ctx, wf.LockSQL, id); err != nil {
-		return resp, fmt.Errorf("gearbox: lock %s: %w", wf.Entity, err)
+	if !batched {
+		// 0. Source attribution.
+		if err := eng.writeSource(ctx, tx, wf.Entity, action.name); err != nil {
+			return resp, err
+		}
+		// 1. FOR UPDATE on the entity row.
+		if _, err := tx.Exec(ctx, wf.LockSQL, id); err != nil {
+			return resp, fmt.Errorf("gearbox: lock %s: %w", wf.Entity, err)
+		}
 	}
 	// 2. Load.
 	entity, err := wf.Load(ctx, db, id)

@@ -3,6 +3,7 @@ package gearbox_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -132,6 +133,37 @@ func TestRunAllInTx_ComposesOnCallerTxWithoutGate(t *testing.T) {
 	}
 	if m["a"].Status != fxReady || m["b"].Status != fxReady {
 		t.Fatalf("statuses = %q/%q, want ready/ready", m["a"].Status, m["b"].Status)
+	}
+}
+
+func TestRunAllInTx_BatchPaysTwoFixedStatements(t *testing.T) {
+	m := map[string]*fixtureEntity{
+		"a": {ID: "a", Status: fxDraft},
+		"b": {ID: "b", Status: fxDraft},
+		"c": {ID: "c", Status: fxDraft},
+	}
+	a := publishOn(mapFixture(m))
+	rec := newRecordingTx()
+	eng := engineOver(txRunner(rec), gearbox.Config{
+		Source: gearbox.GUCSourceWriter{GUC: "gearbox.source"},
+	})
+
+	if _, err := gearbox.RunAllInTx(context.Background(), rec, eng, a, gearbox.IDs{"c", "a", "b"}, struct{}{}); err != nil {
+		t.Fatalf("RunAllInTx: %v", err)
+	}
+	if len(rec.Calls) != 2 {
+		t.Fatalf("Execs = %d, want exactly 2 (one source write + one batch lock), got: %+v", len(rec.Calls), rec.Calls)
+	}
+	if !strings.Contains(rec.Calls[0].SQL, "set_config") {
+		t.Fatalf("first Exec = %q, want the source write", rec.Calls[0].SQL)
+	}
+	lock := rec.Calls[1]
+	if !strings.Contains(lock.SQL, `"fixtures"`) || !strings.Contains(lock.SQL, "in ($1,$2,$3)") ||
+		!strings.Contains(lock.SQL, "order by id for update") {
+		t.Fatalf("batch lock SQL = %q", lock.SQL)
+	}
+	if len(lock.Args) != 3 || lock.Args[0] != "a" { // sorted
+		t.Fatalf("batch lock args = %v, want sorted [a b c]", lock.Args)
 	}
 }
 
