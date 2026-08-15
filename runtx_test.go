@@ -69,6 +69,32 @@ func TestRunInTx_StayEdgeKeepsStatus(t *testing.T) {
 	}
 }
 
+func TestRunInTx_DeletesEdgeSkipsStatusWriteAndSave(t *testing.T) {
+	ent := &fixtureEntity{ID: "e1", Status: fxDraft}
+	wf := singleFixture(ent)
+	var bodyRan bool
+	a := gearbox.NewAction(wf, gearbox.ActionConfig{Name: "Purge"},
+		func(_ context.Context, _ *gearbox.DB, _ *fixtureEntity, _ struct{}) (struct{}, error) {
+			bodyRan = true // the body owns the DELETE
+			return struct{}{}, nil
+		})
+	wf.Transitions(gearbox.Transitions[string]{fxDraft: {a.Deletes()}})
+	eng, _ := allowAllEngine(nilTx{})
+
+	if _, err := gearbox.RunInTx(context.Background(), nilTx{}, eng, a, "e1", struct{}{}); err != nil {
+		t.Fatalf("RunInTx: %v", err)
+	}
+	if !bodyRan {
+		t.Fatal("body did not run")
+	}
+	if ent.Status != fxDraft || ent.Saved {
+		t.Fatalf("status=%q saved=%v — a Deletes edge must skip status write and Save", ent.Status, ent.Saved)
+	}
+	if d := a.Descriptor(); d.Edges[fxDraft] != "<deleted>" {
+		t.Fatalf("Deletes edge descriptor = %q, want <deleted>", d.Edges[fxDraft])
+	}
+}
+
 func TestRunInTx_WrongFromStatus(t *testing.T) {
 	ent := &fixtureEntity{ID: "e1", Status: fxCompleted} // not draft
 	a := publishOn(singleFixture(ent))

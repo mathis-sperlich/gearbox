@@ -25,6 +25,12 @@ type WorkflowConfig[T any, S ~string] struct {
 	StatusColumn string
 	// StatusField names the entity struct field holding the status. Defaults to "Status".
 	StatusField string
+	// StatusOf and SetStatus override the reflection-derived accessors, for
+	// entities whose workflow status is computed rather than stored in a plain
+	// string field (e.g. a synthetic status derived from a bool). Set both or
+	// neither; when set, StatusField is ignored.
+	StatusOf  func(*T) S
+	SetStatus func(*T, S)
 	// Initial lists the statuses a freshly-inserted row may enter at. Informational.
 	Initial []S
 	// LockSQL is the single-row lock run before Load. Defaults to
@@ -102,7 +108,15 @@ func NewWorkflow[T any, S ~string](cfg WorkflowConfig[T, S]) *Workflow[T, S] {
 	if wf.LockSQL == "" {
 		wf.LockSQL = `SELECT 1 FROM ` + quoteIdent(cfg.Entity) + ` WHERE id = $1 FOR UPDATE`
 	}
-	wf.statusOf, wf.setStatus = statusAccessors[T](cfg.StatusField)
+	switch {
+	case cfg.StatusOf != nil && cfg.SetStatus != nil:
+		wf.statusOf = func(e *T) string { return string(cfg.StatusOf(e)) }
+		wf.setStatus = func(e *T, s string) { cfg.SetStatus(e, S(s)) }
+	case cfg.StatusOf != nil || cfg.SetStatus != nil:
+		panic("gearbox: " + cfg.Entity + ": StatusOf and SetStatus must be set together")
+	default:
+		wf.statusOf, wf.setStatus = statusAccessors[T](cfg.StatusField)
+	}
 	if cfg.Load == nil || cfg.Save == nil {
 		// Fail at boot if the CRUD-derived Load/Save can't work on T.
 		m := metaOf(typeOf[T]())
@@ -185,7 +199,7 @@ func (wf *Workflow[T, S]) Transitions(t Transitions[S]) {
 				panic(fmt.Sprintf("gearbox: %s: edge under %q references action %s.%s from another workflow",
 					wf.RegistryKey(), string(from), d.Workflow, d.Name))
 			}
-			e.a.addEdge(string(from), e.target)
+			e.a.addEdge(string(from), actionEdge{target: e.target, deletes: e.deletes})
 			if e.target != "" {
 				set[e.target] = true
 			}

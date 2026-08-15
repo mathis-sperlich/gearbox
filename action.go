@@ -36,7 +36,14 @@ type Action[T any, S ~string, Req any, Resp any] struct {
 	name  string
 	role  string
 	fn    ActionFn[T, Req, Resp]
-	edges map[string]string // from status → target status ("" = stay)
+	edges map[string]actionEdge // keyed by from status
+}
+
+// actionEdge is one wired transition: where it moves the entity, or that the
+// body deletes the row (skip status write + save).
+type actionEdge struct {
+	target  string // "" = stay
+	deletes bool
 }
 
 // NewAction builds an Action and registers it on wf (duplicate names panic at
@@ -61,7 +68,7 @@ func NewAction[T any, S ~string, Req any, Resp any](
 		name:  cfg.Name,
 		role:  cfg.Role,
 		fn:    fn,
-		edges: map[string]string{},
+		edges: map[string]actionEdge{},
 	}
 	if _, dupe := wf.byName[a.name]; dupe {
 		panic("gearbox: duplicate action name " + a.name + " on " + wf.RegistryKey())
@@ -73,12 +80,13 @@ func NewAction[T any, S ~string, Req any, Resp any](
 // Name returns the action's registered name.
 func (a *Action[T, S, Req, Resp]) Name() string { return a.name }
 
-// Edge is one entry of a Transitions map: an action plus the status it moves
-// the entity to. Non-generic so actions with different Req/Resp types share a
-// map. Build with Action.To or Action.Stay.
+// Edge is one entry of a Transitions map: an action plus what happens to the
+// entity's status on success. Non-generic so actions with different Req/Resp
+// types share a map. Build with Action.To, Action.Stay, or Action.Deletes.
 type Edge struct {
-	a      registered
-	target string
+	a       registered
+	target  string
+	deletes bool
 }
 
 // To declares that, from the status this edge is filed under, the action moves
@@ -90,12 +98,17 @@ func (a *Action[T, S, Req, Resp]) To(target S) Edge { return Edge{a: a, target: 
 // but never changes it (logging, annotating, side effects).
 func (a *Action[T, S, Req, Resp]) Stay() Edge { return Edge{a: a} }
 
-// addEdge records from → target; duplicate froms for one action panic at boot.
-func (a *Action[T, S, Req, Resp]) addEdge(from, target string) {
+// Deletes declares a terminal action: the body deletes the entity row itself
+// (plus any dependent-row cleanup), so on success the engine skips the status
+// write and Save — there is no row left to save.
+func (a *Action[T, S, Req, Resp]) Deletes() Edge { return Edge{a: a, deletes: true} }
+
+// addEdge records one wired transition; duplicate froms for one action panic at boot.
+func (a *Action[T, S, Req, Resp]) addEdge(from string, e actionEdge) {
 	if _, dupe := a.edges[from]; dupe {
 		panic(fmt.Sprintf("gearbox: %s.%s: duplicate edge from %q", a.wf.RegistryKey(), a.name, from))
 	}
-	a.edges[from] = target
+	a.edges[from] = e
 }
 
 // fromSet returns the statuses this action is legal from, sorted.
@@ -112,8 +125,9 @@ func (a *Action[T, S, Req, Resp]) fromSet() []string {
 type ActionDescriptor struct {
 	Workflow string `json:"workflow"`
 	Name     string `json:"name"`
-	// Edges maps each legal source status to the target status; an empty target
-	// means the action does not change status.
+	// Edges maps each legal source status to the target status. An empty target
+	// means the action does not change status (Stay); "<deleted>" means the
+	// action deletes the row (Deletes).
 	Edges        map[string]string `json:"edges"`
 	Role         string            `json:"role"`
 	RequestType  string            `json:"request_type"`
@@ -123,7 +137,7 @@ type ActionDescriptor struct {
 // registered is the interface every typed Action satisfies for the registry.
 type registered interface {
 	Descriptor() ActionDescriptor
-	addEdge(from, target string)
+	addEdge(from string, e actionEdge)
 }
 
 // Descriptor returns the type-erased shape. Edges is a defensive copy.
@@ -131,7 +145,11 @@ func (a *Action[T, S, Req, Resp]) Descriptor() ActionDescriptor {
 	var zReq Req
 	var zResp Resp
 	edges := make(map[string]string, len(a.edges))
-	for f, t := range a.edges {
+	for f, e := range a.edges {
+		t := e.target
+		if e.deletes {
+			t = "<deleted>"
+		}
 		edges[f] = t
 	}
 	return ActionDescriptor{

@@ -129,7 +129,7 @@ func RunInTx[T any, S ~string, Req any, Resp any](
 	}
 	// 3. Validate: the current status must have an edge for this action.
 	got := wf.statusOf(entity)
-	target, ok := action.edges[got]
+	edge, ok := action.edges[got]
 	if !ok {
 		return resp, fmt.Errorf("%w: %s.%s requires from=%v, entity is %s",
 			ErrInvalidTransition, wf.RegistryKey(), action.name, action.fromSet(), got)
@@ -140,9 +140,13 @@ func RunInTx[T any, S ~string, Req any, Resp any](
 		return resp, runErr
 	}
 	resp = r
+	// A Deletes edge means the body removed the row — nothing to write or save.
+	if edge.deletes {
+		return resp, nil
+	}
 	// 5. Transition along the edge. A Stay edge (empty target) keeps the status.
-	if target != "" {
-		wf.setStatus(entity, target)
+	if edge.target != "" {
+		wf.setStatus(entity, edge.target)
 	}
 	// 6. Save.
 	if err := wf.Save(ctx, db, entity); err != nil {

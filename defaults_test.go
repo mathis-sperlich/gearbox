@@ -28,6 +28,38 @@ func TestDefaults_ReflectedStatusAndDerivedLock(t *testing.T) {
 	}
 }
 
+// StatusOf/SetStatus overrides carry a synthetic status (derived from a bool)
+// with no reflection on any string field.
+func TestDefaults_StatusAccessorOverrides(t *testing.T) {
+	type flagged struct {
+		ID   string
+		Live bool
+	}
+	ent := &flagged{ID: "e1", Live: true}
+	wf := gearbox.NewWorkflow(gearbox.WorkflowConfig[flagged, string]{
+		Entity: "flags",
+		StatusOf: func(e *flagged) string {
+			if e.Live {
+				return "on"
+			}
+			return "off"
+		},
+		SetStatus: func(e *flagged, s string) { e.Live = s == "on" },
+		Load:      func(_ context.Context, _ *gearbox.DB, _ string) (*flagged, error) { return ent, nil },
+		Save:      func(_ context.Context, _ *gearbox.DB, _ *flagged) error { return nil },
+	})
+	a := gearbox.NewAction(wf, gearbox.ActionConfig{Name: "Off"}, gearbox.Noop[flagged, struct{}])
+	wf.Transitions(gearbox.Transitions[string]{"on": {a.To("off")}})
+
+	eng, _ := allowAllEngine(nilTx{})
+	if _, err := gearbox.Run(context.Background(), eng, nil, a, "e1", struct{}{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ent.Live {
+		t.Fatal("SetStatus override did not flip the bool")
+	}
+}
+
 func TestDefaults_NonStructEntityPanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {
