@@ -33,15 +33,8 @@ type ClaimsSet struct {
 // stop working soon. Keep sessions longer than this by signing a fresh token.
 const MaxTTL = time.Hour
 
-// Sign creates a JWT for c (RFC 7519 §7.1) as a compact JWS (RFC 7515),
-// signed with the Verifier's key and valid from now for ttl, which must be
-// positive and at most MaxTTL. It returns the token and its expiry. The token
-// always carries `exp`, so the default Verifier accepts it until it expires
-// and rejects it after. A verify-only Ed25519 Verifier refuses to sign.
-func (v *Verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token string, expiresAt time.Time, err error) {
+func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token string, expiresAt time.Time, err error) {
 	switch {
-	case v.alg == ed25519Alg && v.privateKey == nil:
-		return "", time.Time{}, errors.New("authjwt: sign: verifier holds no private key")
 	case ttl <= 0:
 		return "", time.Time{}, errors.New("authjwt: sign: ttl must be positive")
 	case ttl > MaxTTL:
@@ -61,13 +54,17 @@ func (v *Verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token st
 		return "", time.Time{}, fmt.Errorf("authjwt: sign: %w", err)
 	}
 	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(v.signature(signingInput)), expiresAt, nil
+	sig, err := v.signature(signingInput)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), expiresAt, nil
 }
 
 // claimSet converts c into the JSON claim set of a token issued at iat and
 // expiring at exp. Extra goes in first and the claims Sign owns last, so an
 // extra can never overwrite them; a reserved key in Extra is still an error.
-func (v *Verifier) claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, error) {
+func (v *verifier) claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, error) {
 	if c.Subject == "" {
 		return nil, errors.New("authjwt: sign: empty subject")
 	}

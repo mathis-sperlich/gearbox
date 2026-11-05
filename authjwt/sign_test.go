@@ -152,8 +152,8 @@ func TestSign_ExtraIssAllowedWithoutIssuer(t *testing.T) {
 
 func TestSign_TokenFromOtherSecretRejected(t *testing.T) {
 	// Given a token signed under secret A
-	signer, _ := authjwt.NewVerifier("secret-a-secret-a")
-	otherVerifier, _ := authjwt.NewVerifier("secret-b-secret-b")
+	signer, _ := authjwt.NewVerifier("secret-a-secret-a-secret-a-secret-a")
+	otherVerifier, _ := authjwt.NewVerifier("secret-b-secret-b-secret-b-secret-b")
 	token, _, err := signer.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour, time.Now())
 	if err != nil {
 		t.Fatalf("Sign: %v", err)

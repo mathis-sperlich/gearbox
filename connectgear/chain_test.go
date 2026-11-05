@@ -76,7 +76,7 @@ func serve(t *testing.T, s *seen, opts connect.HandlerOption) string {
 	return srv.URL
 }
 
-func verifier(t *testing.T, secret string) *authjwt.Verifier {
+func verifier(t *testing.T, secret string) authjwt.Verifier {
 	t.Helper()
 	v, err := authjwt.NewVerifier(secret)
 	if err != nil {
@@ -85,7 +85,7 @@ func verifier(t *testing.T, secret string) *authjwt.Verifier {
 	return v
 }
 
-func token(t *testing.T, v *authjwt.Verifier, ttl time.Duration, now time.Time) string {
+func token(t *testing.T, v authjwt.Verifier, ttl time.Duration, now time.Time) string {
 	t.Helper()
 	tok, _, err := v.Sign(authjwt.ClaimsSet{Subject: "user-1"}, ttl, now)
 	if err != nil {

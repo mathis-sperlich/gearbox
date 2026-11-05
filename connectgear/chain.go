@@ -23,9 +23,9 @@ import (
 // with the message withheld).
 type Authenticator func(ctx context.Context, spec connect.Spec, header http.Header) (gearbox.Principal, error)
 
-// Bearer is an Authenticator that verifies an HS256 "Authorization: Bearer"
-// token with v and yields its *authjwt.Claims as the Principal.
-func Bearer(v *authjwt.Verifier) Authenticator {
+// Bearer is an Authenticator that verifies an "Authorization: Bearer" token
+// with v and yields its *authjwt.Claims as the Principal.
+func Bearer(v authjwt.Verifier) Authenticator {
 	return func(_ context.Context, _ connect.Spec, h http.Header) (gearbox.Principal, error) {
 		c, err := v.VerifyBearer(h.Get("Authorization"))
 		if err != nil {

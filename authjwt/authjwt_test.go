@@ -14,7 +14,7 @@ import (
 	"github.com/mathis-sperlich/gearbox/authjwt"
 )
 
-const testSecret = "super-secret-signing-key"
+const testSecret = "super-secret-signing-key-of-32-bytes!"
 
 // inAnHour is an expiry an hour out — tokens need an `exp` by default.
 func inAnHour() int64 { return time.Now().Add(time.Hour).Unix() }
@@ -38,7 +38,7 @@ func signToken(t *testing.T, alg, secret string, claims map[string]any) string {
 	return signingInput + "." + enc.EncodeToString(mac.Sum(nil))
 }
 
-func newVerifier(t *testing.T, opts ...authjwt.Option) *authjwt.Verifier {
+func newVerifier(t *testing.T, opts ...authjwt.Option) authjwt.Verifier {
 	t.Helper()
 	v, err := authjwt.NewVerifier(testSecret, opts...)
 	if err != nil {
@@ -87,21 +87,6 @@ func TestAuthJWT_VerifyBearerValidYieldsClaims(t *testing.T) {
 	}
 	if roles := authjwt.RolesOf(claims); len(roles) != 1 || roles[0] != "admin" {
 		t.Fatalf("RolesOf = %v, want [admin]", roles)
-	}
-}
-
-func TestAuthJWT_MissingExpAllowedWithOption(t *testing.T) {
-	// Given a verifier that allows exp-less tokens, and such a token
-	v := newVerifier(t, authjwt.AllowMissingExpiration())
-	noExpToken := signToken(t, "HS256", testSecret, map[string]any{"sub": "user-1"})
-	// When it is verified
-	claims, err := v.Verify(noExpToken)
-	// Then it is accepted
-	if err != nil {
-		t.Fatalf("Verify with AllowMissingExpiration: %v", err)
-	}
-	if claims.Subject != "user-1" {
-		t.Fatalf("Subject = %q, want user-1", claims.Subject)
 	}
 }
 
@@ -172,5 +157,16 @@ func TestAuthJWT_VerifyBearerNoHeaderUnauthenticated(t *testing.T) {
 	// Then the caller is unauthenticated
 	if !errors.Is(err, gearbox.ErrUnauthenticated) {
 		t.Fatalf("err = %v, want ErrUnauthenticated", err)
+	}
+}
+
+func TestAuthJWT_RejectsShortSecret(t *testing.T) {
+	// Given an HS256 secret one byte under MinSecretSize
+	shortSecret := strings.Repeat("x", authjwt.MinSecretSize-1)
+	// When a verifier is built from it
+	_, err := authjwt.NewVerifier(shortSecret)
+	// Then the constructor refuses
+	if err == nil {
+		t.Fatalf("NewVerifier accepted a %d-byte secret", len(shortSecret))
 	}
 }

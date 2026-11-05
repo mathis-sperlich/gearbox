@@ -45,51 +45,73 @@ type Claims struct {
 
 // Verifier validates bearer tokens of exactly one algorithm, and signs them
 // when it holds the signing key (an HS256 secret or an Ed25519 private key).
-type Verifier struct {
+// Only the New* constructors produce one, so a Verifier is always bound to a
+// known algorithm and a key; there is no zero value that could accept a token.
+type Verifier interface {
+	// Verify parses and validates a token string, returning its Claims.
+	//
+	// The token must be a compact JWS signed with the Verifier's algorithm
+	// and key. Any other alg, including "none", is refused, so an HS256 token
+	// never passes an Ed25519 Verifier or the other way round; HS256
+	// signatures are compared in constant time. `exp` is required and must
+	// lie in the future (a token that never expires is never accepted),
+	// `nbf`, when present, in the past, and `sub` must be a non-empty string.
+	Verify(token string) (Claims, error)
+	// VerifyBearer verifies an "Authorization" header value ("Bearer <token>"),
+	// yielding *Claims for use as the gearbox Principal. A missing/invalid
+	// token becomes gearbox.ErrUnauthenticated.
+	VerifyBearer(header string) (*Claims, error)
+	// Sign creates a JWT for c (RFC 7519 §7.1) as a compact JWS (RFC 7515),
+	// signed with the Verifier's key and valid from now for ttl, which must
+	// be positive and at most MaxTTL. It returns the token and its expiry.
+	// The token always carries `exp`, so a Verifier accepts it until
+	// it expires and rejects it after. A verify-only Ed25519 Verifier refuses
+	// to sign.
+	Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token string, expiresAt time.Time, err error)
+}
+
+// MinSecretSize is the shortest HS256 secret NewVerifier accepts: the
+// HMAC-SHA256 output size, as RFC 7518 §3.2 requires.
+const MinSecretSize = sha256.Size
+
+// verifier is the only Verifier implementation.
+type verifier struct {
 	alg        algorithm
 	secret     []byte             // HS256 only
 	publicKey  ed25519.PublicKey  // Ed25519 only
 	privateKey ed25519.PrivateKey // Ed25519 only; nil for a verify-only Verifier
 	rolesClaim string
-	allowNoExp bool
 }
 
 // Option configures a Verifier.
-type Option func(*Verifier)
+type Option func(*verifier)
 
 // WithRolesClaim sets the claim name roles are read from (default "roles").
 func WithRolesClaim(name string) Option {
-	return func(v *Verifier) { v.rolesClaim = name }
+	return func(v *verifier) { v.rolesClaim = name }
 }
 
-// AllowMissingExpiration relaxes the default requirement that tokens carry an
-// `exp` claim. By default exp-less tokens are rejected (a leaked one is valid
-// forever); use this only if your issuer deliberately issues them.
-func AllowMissingExpiration() Option {
-	return func(v *Verifier) { v.allowNoExp = true }
-}
-
-// NewVerifier builds an HS256 Verifier from the HMAC signing secret. It both
-// signs and verifies, so every service that checks tokens also holds the key
-// that forges them.
+// NewVerifier builds an HS256 Verifier from the HMAC signing secret, which
+// must be at least MinSecretSize bytes. It both signs and verifies, so every
+// service that checks tokens also holds the key that forges them.
 //
 // Deprecated: Use NewEd25519Signer in the service that issues tokens and
 // NewEd25519Verifier, with the matching public key, wherever tokens are only
 // checked. NewVerifier stays for existing HS256 deployments.
-func NewVerifier(secret string, opts ...Option) (*Verifier, error) {
-	if strings.TrimSpace(secret) == "" {
-		return nil, errors.New("authjwt: empty signing secret")
+func NewVerifier(secret string, opts ...Option) (Verifier, error) {
+	if len(secret) < MinSecretSize {
+		return nil, fmt.Errorf("authjwt: HS256 secret must be at least %d bytes, got %d", MinSecretSize, len(secret))
 	}
-	return newVerifier(&Verifier{alg: hs256, secret: []byte(secret)}, opts), nil
+	return newVerifier(&verifier{alg: hs256, secret: []byte(secret)}, opts), nil
 }
 
 // NewEd25519Signer builds a Verifier that signs and verifies Ed25519 tokens
 // with privateKey. Use it in the backend that issues tokens.
-func NewEd25519Signer(privateKey ed25519.PrivateKey, opts ...Option) (*Verifier, error) {
+func NewEd25519Signer(privateKey ed25519.PrivateKey, opts ...Option) (Verifier, error) {
 	if len(privateKey) != ed25519.PrivateKeySize {
 		return nil, errors.New("authjwt: Ed25519 private key has the wrong size")
 	}
-	v := &Verifier{
+	v := &verifier{
 		alg:        ed25519Alg,
 		publicKey:  privateKey.Public().(ed25519.PublicKey),
 		privateKey: privateKey,
@@ -99,14 +121,14 @@ func NewEd25519Signer(privateKey ed25519.PrivateKey, opts ...Option) (*Verifier,
 
 // NewEd25519Verifier builds a verify-only Verifier for Ed25519 tokens signed
 // with the private key belonging to publicKey. Sign refuses on it.
-func NewEd25519Verifier(publicKey ed25519.PublicKey, opts ...Option) (*Verifier, error) {
+func NewEd25519Verifier(publicKey ed25519.PublicKey, opts ...Option) (Verifier, error) {
 	if len(publicKey) != ed25519.PublicKeySize {
 		return nil, errors.New("authjwt: Ed25519 public key has the wrong size")
 	}
-	return newVerifier(&Verifier{alg: ed25519Alg, publicKey: publicKey}, opts), nil
+	return newVerifier(&verifier{alg: ed25519Alg, publicKey: publicKey}, opts), nil
 }
 
-func newVerifier(v *Verifier, opts []Option) *Verifier {
+func newVerifier(v *verifier, opts []Option) *verifier {
 	v.rolesClaim = "roles"
 	for _, o := range opts {
 		o(v)
@@ -114,15 +136,7 @@ func newVerifier(v *Verifier, opts []Option) *Verifier {
 	return v
 }
 
-// Verify parses and validates a token string, returning its Claims.
-//
-// The token must be a compact JWS signed with the Verifier's algorithm and
-// key. Any other alg, including "none", is refused, so an HS256 token never
-// passes an Ed25519 Verifier or the other way round; HS256 signatures are
-// compared in constant time. `exp` must lie in the future (required unless
-// AllowMissingExpiration), `nbf`, when present, in the past, and `sub` must
-// be a non-empty string.
-func (v *Verifier) Verify(token string) (Claims, error) {
+func (v *verifier) Verify(token string) (Claims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return Claims{}, errors.New("authjwt: malformed token")
@@ -147,9 +161,9 @@ func (v *Verifier) Verify(token string) (Claims, error) {
 	}
 	now := time.Now()
 	switch {
-	case reg.ExpirationTime.IsZero() && !v.allowNoExp:
+	case reg.ExpirationTime.IsZero():
 		return Claims{}, errors.New("authjwt: token has no exp claim")
-	case !reg.ExpirationTime.IsZero() && !now.Before(reg.ExpirationTime.Time):
+	case !now.Before(reg.ExpirationTime.Time):
 		return Claims{}, errors.New("authjwt: token is expired")
 	case !reg.NotBefore.IsZero() && now.Before(reg.NotBefore.Time):
 		return Claims{}, errors.New("authjwt: token is not valid yet")
@@ -209,22 +223,40 @@ func (d *numericDate) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// signature returns the signature of a JWS signing input. The caller makes
-// sure the Verifier holds a signing key.
-func (v *Verifier) signature(signingInput string) []byte {
-	if v.alg == ed25519Alg {
-		return ed25519.Sign(v.privateKey, []byte(signingInput))
+// signature returns the signature of a JWS signing input, or an error when
+// the verifier holds no signing key for its algorithm.
+func (v *verifier) signature(signingInput string) ([]byte, error) {
+	switch v.alg {
+	case ed25519Alg:
+		if v.privateKey == nil {
+			return nil, errors.New("authjwt: sign: verifier holds no private key")
+		}
+		return ed25519.Sign(v.privateKey, []byte(signingInput)), nil
+	case hs256:
+		if len(v.secret) < MinSecretSize {
+			return nil, errors.New("authjwt: sign: verifier holds no HS256 secret")
+		}
+		mac := hmac.New(sha256.New, v.secret)
+		mac.Write([]byte(signingInput))
+		return mac.Sum(nil), nil
+	default:
+		return nil, fmt.Errorf("authjwt: sign: unsupported algorithm %q", v.alg)
 	}
-	mac := hmac.New(sha256.New, v.secret)
-	mac.Write([]byte(signingInput))
-	return mac.Sum(nil)
 }
 
-func (v *Verifier) validSignature(signingInput string, sig []byte) bool {
-	if v.alg == ed25519Alg {
-		return ed25519.Verify(v.publicKey, []byte(signingInput), sig)
+// validSignature reports whether sig signs signingInput under the verifier's
+// key. Anything but the two known algorithms is invalid.
+func (v *verifier) validSignature(signingInput string, sig []byte) bool {
+	switch v.alg {
+	case ed25519Alg:
+		return len(v.publicKey) == ed25519.PublicKeySize &&
+			ed25519.Verify(v.publicKey, []byte(signingInput), sig)
+	case hs256:
+		want, err := v.signature(signingInput)
+		return err == nil && hmac.Equal(sig, want)
+	default:
+		return false
 	}
-	return hmac.Equal(sig, v.signature(signingInput))
 }
 
 func decodeSegment(seg string, into any) error {
@@ -238,10 +270,7 @@ func decodeSegment(seg string, into any) error {
 	return nil
 }
 
-// VerifyBearer verifies an "Authorization" header value ("Bearer <token>"),
-// yielding *Claims for use as the gearbox Principal. A missing/invalid token
-// becomes gearbox.ErrUnauthenticated.
-func (v *Verifier) VerifyBearer(header string) (*Claims, error) {
+func (v *verifier) VerifyBearer(header string) (*Claims, error) {
 	if !strings.HasPrefix(header, "Bearer ") {
 		return nil, fmt.Errorf("%w: missing bearer token", gearbox.ErrUnauthenticated)
 	}

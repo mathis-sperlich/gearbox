@@ -125,7 +125,7 @@ func authorize(_ context.Context, p gearbox.Principal, a gearbox.ActionDescripto
 
 // authInterceptor verifies the bearer token and stores the claims as the
 // Principal for handlers to hand to gearbox.
-func authInterceptor(v *authjwt.Verifier) connect.UnaryInterceptorFunc {
+func authInterceptor(v authjwt.Verifier) connect.UnaryInterceptorFunc {
 	return func(next connect.UnaryFunc) connect.UnaryFunc {
 		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
 			claims, err := v.VerifyBearer(req.Header().Get("Authorization"))
