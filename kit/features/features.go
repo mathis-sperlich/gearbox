@@ -1,23 +1,23 @@
 // Package features gates an app's features per tenant scope, keyed by the
 // app's own proto feature enum.
 //
-// The app resolves a user's decisions once, when it signs their token, and
-// Decisions.Embed writes them into the token as the "features" claim:
+// The app resolves a user's Decisions once, when it signs their token, and
+// Decisions.Embed writes them into the token as the "features" claim, by
+// feature name:
 //
 //	"features": { "<scope>": { "FEATURE_X": true, ... }, "*": { ... } }
 //
 // A scope is whatever the app tenants by (an organisation id), spelled
-// exactly as requests name it — the app signs the keys, so lookups are plain
-// map reads. "*" holds decisions for every scope; a global grant is how a
-// feature goes GA. Only explicit decisions appear; anything absent is off.
+// exactly as requests name it; "*" carries the global grants. Only explicit
+// decisions appear; anything absent is off.
 //
-// Checks never touch the database: the Gate and Decisions.Enabled read the
-// claims connectgear's AuthInterceptor already verified and holds in memory.
-// A decision is therefore as fresh as the token (bounded by its TTL).
+// Checks never touch the database: NewGate reads the claims connectgear's
+// AuthInterceptor already verified and holds in memory, so a decision is as
+// fresh as the token.
 package features
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"slices"
 	"strings"
@@ -25,30 +25,82 @@ import (
 	"github.com/mathis-sperlich/gearbox/authjwt"
 )
 
-// ClaimName is the JWT claim the decisions travel in.
-const ClaimName = "features"
-
-// GlobalBucket is the claim bucket for decisions that apply in every scope.
-const GlobalBucket = "*"
-
 // Feature is an app's feature enum; a generated proto enum satisfies it. A
-// feature's name (String) is its identity everywhere outside the binary: the
-// claim and the app's decisions table store the name, never the number.
+// feature's name (String) is its identity outside the binary: the claim and
+// the app's decisions table store the name, never the number.
 type Feature interface {
 	~int32
 	String() string
 }
 
-// Registry is the set of features an enum defines.
-type Registry[F Feature] struct {
-	names map[string]bool
+// Grants are explicit decisions: true turns a feature on, false turns it off.
+// Anything absent is undecided.
+type Grants[F Feature] map[F]bool
+
+// Decisions is what the app resolved for a user at sign-in. A scope's own
+// grant beats the global one; no grant at all means off.
+type Decisions[F Feature] struct {
+	// Global grants apply in every scope; a feature rolled out to everyone
+	// is granted here.
+	Global Grants[F]
+	// ByScope grants apply in one scope, keyed by the id requests name.
+	ByScope map[string]Grants[F]
 }
 
-// NewRegistry builds a Registry from the enum's generated name→value map
-// (Foo_value). An enum whose only value is zero is valid: the app gates
-// nothing yet.
-func NewRegistry[F Feature](values map[string]int32) (*Registry[F], error) {
-	r := &Registry[F]{names: make(map[string]bool, len(values))}
+// Enabled reports whether f is on in scope. An empty scope or "*" names no
+// tenant and is off, so a request can't reach the global grants by naming "*".
+func (d Decisions[F]) Enabled(f F, scope string) bool {
+	if scope == "" || scope == globalScope {
+		return false
+	}
+	if on, ok := d.ByScope[scope][f]; ok {
+		return on
+	}
+	return d.Global[f]
+}
+
+// Embed writes d into c as the "features" claim, replacing any earlier one.
+func (d Decisions[F]) Embed(c *authjwt.ClaimsSet) {
+	if c.Extra == nil {
+		c.Extra = map[string]any{}
+	}
+	c.Extra[claimName] = d.claim()
+}
+
+// The wire form of Decisions: the "features" claim maps a scope, or "*" for
+// the global grants, to feature name → decision.
+const (
+	claimName   = "features"
+	globalScope = "*"
+)
+
+type claim map[string]map[string]bool
+
+func (d Decisions[F]) claim() claim {
+	wire := make(claim, len(d.ByScope)+1)
+	if len(d.Global) > 0 {
+		wire[globalScope] = d.Global.byName()
+	}
+	for scope, grants := range d.ByScope {
+		wire[scope] = grants.byName()
+	}
+	return wire
+}
+
+func (g Grants[F]) byName() map[string]bool {
+	named := make(map[string]bool, len(g))
+	for f, on := range g {
+		named[f.String()] = on
+	}
+	return named
+}
+
+// enum maps feature names back to the app's enum values. It is built from
+// the enum's generated name→value map (Foo_value) and excludes zero.
+type enum[F Feature] map[string]F
+
+func newEnum[F Feature](values map[string]int32) (enum[F], error) {
+	e := make(enum[F], len(values))
 	for name, v := range values {
 		if got := F(v).String(); got != name {
 			return nil, fmt.Errorf("features: enum value %d is named %q, but String() says %q", v, name, got)
@@ -62,22 +114,55 @@ func NewRegistry[F Feature](values map[string]int32) (*Registry[F], error) {
 			}
 			continue
 		}
-		r.names[name] = true
+		e[name] = F(v)
 	}
-	return r, nil
+	return e, nil
 }
 
-// Known reports whether f is a feature of the enum (zero is not).
-func (r *Registry[F]) Known(f F) bool { return r.names[f.String()] }
+// decisionsOf reads the "features" claim out of a verified claim set. A token
+// without the claim has no decisions; the app signed the claim, so any other
+// shape is an error. A name the enum no longer defines is dropped: the
+// feature is gone, so it is off.
+func (e enum[F]) decisionsOf(raw []byte) (Decisions[F], error) {
+	var claims struct {
+		Features claim `json:"features"` // claimName
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return Decisions[F]{}, fmt.Errorf("features: malformed %q claim: %w", claimName, err)
+	}
+	d := Decisions[F]{ByScope: make(map[string]Grants[F], len(claims.Features))}
+	for scope, named := range claims.Features {
+		if scope == globalScope {
+			d.Global = e.grants(named)
+		} else {
+			d.ByScope[scope] = e.grants(named)
+		}
+	}
+	return d, nil
+}
 
-// AssertKnown fails when stored names a feature the enum doesn't define — a
-// typo'd row, or one left behind by a deleted enum value — so it red-lights
-// boot instead of surfacing later as a silently dark feature. stored is
-// typically `select distinct feature from feature_access`.
-func (r *Registry[F]) AssertKnown(stored []string) error {
+func (e enum[F]) grants(named map[string]bool) Grants[F] {
+	g := make(Grants[F], len(named))
+	for name, on := range named {
+		if f, known := e[name]; known {
+			g[f] = on
+		}
+	}
+	return g
+}
+
+// AssertKnown fails when stored names a feature the enum (its generated
+// name→value map, Foo_value) doesn't define: a typo'd row, or one left behind
+// by a deleted enum value. Run it at boot with
+// `select distinct feature from feature_access`.
+func AssertKnown[F Feature](values map[string]int32, stored []string) error {
+	e, err := newEnum[F](values)
+	if err != nil {
+		return err
+	}
 	var unknown []string
 	for _, name := range stored {
-		if !r.names[name] {
+		if _, known := e[name]; !known {
 			unknown = append(unknown, name)
 		}
 	}
@@ -86,45 +171,4 @@ func (r *Registry[F]) AssertKnown(stored []string) error {
 		return fmt.Errorf("features: stored feature names the enum doesn't define: %v", slices.Compact(unknown))
 	}
 	return nil
-}
-
-// Decisions is the "features" claim: scope (or GlobalBucket) → feature name →
-// explicit decision.
-type Decisions map[string]map[string]bool
-
-// Embed writes d into mc as the ClaimName claim, replacing any earlier one.
-func (d Decisions) Embed(mc *authjwt.ClaimsSet) {
-	if mc.Extra == nil {
-		mc.Extra = map[string]any{}
-	}
-	mc.Extra[ClaimName] = d
-}
-
-// FromClaims converts the ClaimName claim of verified claims
-// (authjwt.Claims.Raw) to Decisions. A token without the claim has none. The
-// app signed the claim, so any other shape is an error, not something to
-// work around.
-func FromClaims(raw map[string]any) (Decisions, error) {
-	b, err := json.Marshal(raw[ClaimName])
-	if err != nil {
-		return nil, fmt.Errorf("features: %w", err)
-	}
-	var d Decisions
-	if err := json.Unmarshal(b, &d); err != nil {
-		return nil, fmt.Errorf("features: malformed %q claim: %w", ClaimName, err)
-	}
-	return d, nil
-}
-
-// Enabled reports whether f is on in scope: the scope's decision, else the
-// global one, else off. An empty scope or GlobalBucket names no tenant and is
-// off, so a request can't pick up global grants by naming "*".
-func (d Decisions) Enabled(f fmt.Stringer, scope string) bool {
-	if scope == "" || scope == GlobalBucket {
-		return false
-	}
-	if on, ok := d[scope][f.String()]; ok {
-		return on
-	}
-	return d[GlobalBucket][f.String()]
 }

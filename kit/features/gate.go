@@ -13,32 +13,42 @@ import (
 	"github.com/mathis-sperlich/gearbox/connectgear"
 )
 
-// Gate is a fail-closed feature gate over Connect procedures.
-type Gate[F Feature] struct {
+// NewGate returns an interceptor that gates each procedure in methods (full
+// Connect procedure name → feature) on that feature being on for the caller
+// in the scope scopeOf reads off the request message. values is the enum's
+// generated name→value map (Foo_value); gating on a feature it doesn't define
+// is an error.
+//
+// A gated call is refused with PermissionDenied when there is no
+// *authjwt.Claims principal, or the feature is off in the scope (an empty
+// scope is off). Unlisted procedures pass through. Unary requests are checked
+// once; a streaming handler is checked on every message it receives and may
+// not send until the latest one passed. Mount it after
+// connectgear.AuthInterceptor so the principal is in place.
+func NewGate[F Feature](values map[string]int32, methods map[string]F, scopeOf func(msg any) string) (connect.Interceptor, error) {
+	if scopeOf == nil {
+		return nil, errors.New("features: gate needs scopeOf")
+	}
+	e, err := newEnum[F](values)
+	if err != nil {
+		return nil, err
+	}
+	for proc, f := range methods {
+		if _, known := e[f.String()]; !known {
+			return nil, fmt.Errorf("features: %s is gated on unknown feature %s", proc, f.String())
+		}
+	}
+	return &gate[F]{enum: e, methods: maps.Clone(methods), scopeOf: scopeOf}, nil
+}
+
+type gate[F Feature] struct {
+	enum    enum[F]
 	methods map[string]F
 	scopeOf func(msg any) string
 }
 
-// NewGate gates each procedure in methods (full Connect procedure name →
-// feature) on its feature being on for the caller in the scope scopeOf reads
-// off the request message. A gated call is refused with PermissionDenied when
-// there is no *authjwt.Claims principal, or the feature is off in the scope
-// (an empty scope is off). Unlisted procedures pass through. methods is
-// copied; naming a feature reg doesn't define is an error.
-func NewGate[F Feature](reg *Registry[F], methods map[string]F, scopeOf func(msg any) string) (*Gate[F], error) {
-	if reg == nil || scopeOf == nil {
-		return nil, errors.New("features: gate needs a registry and scopeOf")
-	}
-	for proc, f := range methods {
-		if !reg.Known(f) {
-			return nil, fmt.Errorf("features: %s is gated on unknown feature %s", proc, f.String())
-		}
-	}
-	return &Gate[F]{methods: maps.Clone(methods), scopeOf: scopeOf}, nil
-}
-
 // check returns nil when the call on procedure carrying msg may proceed.
-func (g *Gate[F]) check(ctx context.Context, procedure string, msg any) error {
+func (g *gate[F]) check(ctx context.Context, procedure string, msg any) error {
 	f, gated := g.methods[procedure]
 	if !gated {
 		return nil
@@ -47,7 +57,7 @@ func (g *Gate[F]) check(ctx context.Context, procedure string, msg any) error {
 	if !ok || claims == nil {
 		return connect.NewError(connect.CodePermissionDenied, fmt.Errorf("feature %s: no authenticated caller", f))
 	}
-	decisions, err := FromClaims(claims.Raw)
+	decisions, err := g.enum.decisionsOf(claims.Raw)
 	if err != nil {
 		return connect.NewError(connect.CodePermissionDenied, err)
 	}
@@ -57,18 +67,10 @@ func (g *Gate[F]) check(ctx context.Context, procedure string, msg any) error {
 	return nil
 }
 
-// Interceptor checks unary requests, and every message a streaming handler
-// receives (the scope lives on the message). List it after
-// connectgear.AuthInterceptor so the principal is in place. Client calls pass
-// through.
-func (g *Gate[F]) Interceptor() connect.Interceptor { return gateInterceptor[F]{g} }
-
-type gateInterceptor[F Feature] struct{ g *Gate[F] }
-
-func (i gateInterceptor[F]) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+func (g *gate[F]) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
 		if !req.Spec().IsClient {
-			if err := i.g.check(ctx, req.Spec().Procedure, req.Any()); err != nil {
+			if err := g.check(ctx, req.Spec().Procedure, req.Any()); err != nil {
 				return nil, err
 			}
 		}
@@ -76,16 +78,16 @@ func (i gateInterceptor[F]) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc 
 	}
 }
 
-func (i gateInterceptor[F]) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+func (g *gate[F]) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
 	return next
 }
 
-func (i gateInterceptor[F]) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+func (g *gate[F]) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
-		if _, gated := i.g.methods[conn.Spec().Procedure]; !gated {
+		if _, gated := g.methods[conn.Spec().Procedure]; !gated {
 			return next(ctx, conn)
 		}
-		return next(ctx, &gatedConn[F]{StreamingHandlerConn: conn, ctx: ctx, g: i.g})
+		return next(ctx, &gatedConn[F]{StreamingHandlerConn: conn, ctx: ctx, g: g})
 	}
 }
 
@@ -95,7 +97,7 @@ func (i gateInterceptor[F]) WrapStreamingHandler(next connect.StreamingHandlerFu
 type gatedConn[F Feature] struct {
 	connect.StreamingHandlerConn
 	ctx    context.Context
-	g      *Gate[F]
+	g      *gate[F]
 	passed atomic.Bool
 }
 
