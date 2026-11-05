@@ -25,14 +25,18 @@ const (
 	procPublic = "/test.v1.Sheets/Public" // ungated, no credentials needed
 )
 
-// The test service's messages are StringValues whose value is the scope.
+// The test service's messages are StringValues whose "value" field is the scope.
 type scopeMsg = wrapperspb.StringValue
 
-func scopeOf(msg any) string { return msg.(*scopeMsg).GetValue() }
+const scopeField = "value"
 
 func newGate(t *testing.T) connect.Interceptor {
 	t.Helper()
-	g, err := features.NewGate(flagValue, map[string]flag{procSend: flagSheets, procWatch: flagSheets}, scopeOf)
+	g, err := features.NewGate(features.Gate[flag]{
+		Enum:       flagValue,
+		Procedures: map[string]flag{procSend: flagSheets, procWatch: flagSheets},
+		ScopeField: scopeField,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +209,7 @@ func TestNewGate_RefusesUnknownFeatures(t *testing.T) {
 	notFeatures := []flag{flagUnspecified, flag(99)}
 	for _, f := range notFeatures {
 		// When the gate is built
-		_, err := features.NewGate(flagValue, map[string]flag{procSend: f}, scopeOf)
+		_, err := features.NewGate(features.Gate[flag]{Enum: flagValue, Procedures: map[string]flag{procSend: f}, ScopeField: scopeField})
 		// Then it is refused
 		if err == nil {
 			t.Errorf("gate on %v accepted", f)
@@ -213,14 +217,36 @@ func TestNewGate_RefusesUnknownFeatures(t *testing.T) {
 	}
 }
 
-func TestNewGate_RequiresScopeOf(t *testing.T) {
-	// Given a gate with no way to read the scope off a message
+func TestNewGate_RequiresAScopeField(t *testing.T) {
+	// Given a gate with no field to read the scope from
 	// When it is built
-	_, err := features.NewGate(flagValue, map[string]flag{}, nil)
+	_, err := features.NewGate(features.Gate[flag]{Enum: flagValue})
 	// Then it is refused
 	if err == nil {
-		t.Fatal("accepted a gate without scopeOf")
+		t.Fatal("accepted a gate without ScopeField")
 	}
+}
+
+func TestGate_RefusesAMessageWithoutTheScopeField(t *testing.T) {
+	// Given a gate reading "organisation_id", and a caller granted everywhere
+	g, err := features.NewGate(features.Gate[flag]{
+		Enum:       flagValue,
+		Procedures: map[string]flag{procWatch: flagSheets},
+		ScopeField: "organisation_id",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantedGlobally := connectgear.WithPrincipal(context.Background(), &authjwt.Claims{
+		Subject: "user-1", Raw: []byte(`{"features":{"*":{"FLAG_SHEETS":true}}}`),
+	})
+	// When a StringValue, which has no such field, arrives on the gated stream
+	conn := &fakeConn{procedure: procWatch, in: []string{orgA}}
+	err = g.WrapStreamingHandler(func(_ context.Context, c connect.StreamingHandlerConn) error {
+		return c.Receive(&scopeMsg{})
+	})(grantedGlobally, conn)
+	// Then it is refused rather than read as some scope
+	wantDenied(t, "no scope field", err)
 }
 
 // fakeConn is a bidi handler stream whose Receive yields the queued scopes
@@ -296,5 +322,64 @@ func TestGate_BidiRefusesSendBeforeReceive(t *testing.T) {
 	wantDenied(t, "send before receive", err)
 	if conn.sent != 0 {
 		t.Fatal("message sent before any check")
+	}
+}
+
+func TestFromContext_HandlerSeesTheCallersDecisions(t *testing.T) {
+	// Given a caller granted in orgA, calling an ungated unary procedure
+	v := newVerifier(t)
+	claims, err := v.Verify(tokenWith(t, v, inScope(orgA, flagSheets, true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantedInOrgA := connectgear.WithPrincipal(context.Background(), claims)
+	var seen features.Decisions[flag]
+	var ok bool
+	// When the handler asks for the decisions
+	_, err = newGate(t).WrapUnary(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		seen, ok = features.FromContext[flag](ctx)
+		return nil, nil
+	})(grantedInOrgA, connect.NewRequest(&scopeMsg{}))
+	// Then they are the caller's, decoded once by the gate
+	if err != nil || !ok {
+		t.Fatalf("err = %v, ok = %v", err, ok)
+	}
+	if !seen.Enabled(flagSheets, orgA) || seen.Enabled(flagSheets, orgB) {
+		t.Fatalf("decisions = %+v", seen)
+	}
+}
+
+func TestFromContext_StreamHandlerSeesTheCallersDecisions(t *testing.T) {
+	// Given a caller granted in orgA on an ungated stream
+	grantedInOrgA := connectgear.WithPrincipal(context.Background(), &authjwt.Claims{
+		Subject: "user-1",
+		Raw:     []byte(`{"features":{"` + orgA + `":{"FLAG_SHEETS":true}}}`),
+	})
+	var seen features.Decisions[flag]
+	var ok bool
+	// When the handler asks for the decisions
+	conn := &fakeConn{procedure: procTail}
+	err := newGate(t).WrapStreamingHandler(func(ctx context.Context, _ connect.StreamingHandlerConn) error {
+		seen, ok = features.FromContext[flag](ctx)
+		return nil
+	})(grantedInOrgA, conn)
+	// Then they are the caller's
+	if err != nil || !ok || !seen.Enabled(flagSheets, orgA) {
+		t.Fatalf("err = %v, ok = %v, decisions = %+v", err, ok, seen)
+	}
+}
+
+func TestFromContext_NoneWithoutClaims(t *testing.T) {
+	// Given a principal that isn't *authjwt.Claims
+	apiKey := connectgear.WithPrincipal(context.Background(), "api-key-42")
+	var ok bool
+	// When an ungated handler asks for decisions
+	_, err := newGate(t).WrapUnary(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		_, ok = features.FromContext[flag](ctx)
+		return nil, nil
+	})(apiKey, connect.NewRequest(&scopeMsg{}))
+	// Then the call passes but there are none
+	if err != nil || ok {
+		t.Fatalf("err = %v, ok = %v", err, ok)
 	}
 }

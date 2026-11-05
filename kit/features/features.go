@@ -82,6 +82,9 @@ func (d Decisions[F]) claim() claim {
 		wire[globalScope] = d.Global.byName()
 	}
 	for scope, grants := range d.ByScope {
+		if scope == globalScope {
+			continue // Enabled never resolves "*"; it must not become Global
+		}
 		wire[scope] = grants.byName()
 	}
 	return wire

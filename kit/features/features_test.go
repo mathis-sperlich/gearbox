@@ -122,7 +122,7 @@ func TestNewGate_AcceptsAnEnumWithNoFeaturesYet(t *testing.T) {
 	// Given an enum whose only value is the zero one, and nothing to gate
 	onlyUnspecified := map[string]int32{"FLAG_UNSPECIFIED": 0}
 	// When a gate is built
-	_, err := features.NewGate(onlyUnspecified, map[string]flag{}, scopeOf)
+	_, err := features.NewGate(features.Gate[flag]{Enum: onlyUnspecified, ScopeField: scopeField})
 	// Then it is valid
 	if err != nil {
 		t.Fatalf("NewGate = %v", err)
@@ -133,7 +133,7 @@ func TestNewGate_RefusesNamesStringDisagreesWith(t *testing.T) {
 	// Given a name map that disagrees with the enum's String
 	misnamed := map[string]int32{"FLAG_UNSPECIFIED": 0, "FLAG_WRONG": 1}
 	// When a gate is built
-	_, err := features.NewGate(misnamed, map[string]flag{}, scopeOf)
+	_, err := features.NewGate(features.Gate[flag]{Enum: misnamed, ScopeField: scopeField})
 	// Then it fails hard
 	if err == nil {
 		t.Fatal("accepted")
@@ -150,7 +150,7 @@ func TestNewGate_RefusesAFeatureAtZero(t *testing.T) {
 	// Given an enum whose zero value is a real feature
 	featureAtZero := map[string]int32{"FLAG_REPORTS": 0}
 	// When a gate is built
-	_, err := features.NewGate(featureAtZero, map[string]zeroReports{}, scopeOf)
+	_, err := features.NewGate(features.Gate[zeroReports]{Enum: featureAtZero, ScopeField: scopeField})
 	// Then it fails hard, naming the rule
 	if err == nil || !strings.Contains(err.Error(), "_UNSPECIFIED") {
 		t.Fatalf("err = %v", err)
@@ -203,4 +203,16 @@ func both(scope string, f flag, inScopeOn, globalOn bool) features.Decisions[fla
 	d := inScope(scope, f, inScopeOn)
 	d.Global = features.Grants[flag]{f: globalOn}
 	return d
+}
+
+func TestEmbed_DropsAScopeNamedStar(t *testing.T) {
+	// Given decisions whose ByScope names "*", which Enabled never resolves
+	starScoped := features.Decisions[flag]{ByScope: map[string]features.Grants[flag]{"*": {flagSheets: true}}}
+	var signIn authjwt.ClaimsSet
+	// When they are embedded
+	starScoped.Embed(&signIn)
+	// Then the claim carries no global grant from it
+	if got := claimJSON(t, signIn); got != `{}` {
+		t.Fatalf("features claim = %s, want {}", got)
+	}
 }
