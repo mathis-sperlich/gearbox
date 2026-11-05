@@ -132,6 +132,7 @@ func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
 		"two segments":    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0",
 		"not base64":      "!!!.!!!.!!!",
 		"empty":           "",
+		"too large":       signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour(), "blob": strings.Repeat("x", authjwt.MaxTokenSize)}),
 		"tampered claims": tamper(signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour()})),
 	}
 	v := newVerifier(t)

@@ -22,8 +22,9 @@ type ClaimsSet struct {
 	// Audience becomes `aud` when set.
 	Audience string
 	// Extra carries app-specific claims (email, a Postgres `role`, a features
-	// map, a session id, ...). It may not set a claim Sign owns: sub, iat, exp,
-	// roles, and iss/aud when Issuer/Audience are set.
+	// map, a session id, ...), at most MaxExtraClaims of them. It may not set
+	// a claim Sign owns: sub, iat, exp, roles, and iss/aud when Issuer/Audience
+	// are set.
 	Extra map[string]any
 }
 
@@ -31,6 +32,11 @@ type ClaimsSet struct {
 // a bearer token can't be revoked before it expires, so a leaked one must
 // stop working soon. Keep sessions longer than this by signing a fresh token.
 const MaxTTL = time.Hour
+
+// MaxExtraClaims bounds ClaimsSet.Extra. A claim set is a fixed shape the
+// backend decides on, not a bag; a token that needs more is carrying state
+// that belongs in the database.
+const MaxExtraClaims = 16
 
 func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token string, expiresAt time.Time, err error) {
 	switch {
@@ -57,7 +63,11 @@ func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token st
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), expiresAt, nil
+	token = signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+	if len(token) > MaxTokenSize {
+		return "", time.Time{}, fmt.Errorf("authjwt: sign: token exceeds %d bytes", MaxTokenSize)
+	}
+	return token, expiresAt, nil
 }
 
 // claimSet converts c into the JSON claim set of a token issued at iat and
@@ -66,6 +76,9 @@ func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token st
 func (v *verifier) claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, error) {
 	if c.Subject == "" {
 		return nil, errors.New("authjwt: sign: empty subject")
+	}
+	if len(c.Extra) > MaxExtraClaims {
+		return nil, fmt.Errorf("authjwt: sign: %d extra claims, at most %d allowed", len(c.Extra), MaxExtraClaims)
 	}
 	reserved := map[string]any{"sub": c.Subject, "iat": iat.Unix(), "exp": exp.Unix()}
 	if len(c.Roles) > 0 {

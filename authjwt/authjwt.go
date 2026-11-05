@@ -62,7 +62,8 @@ type Verifier interface {
 	VerifyBearer(header string) (*Claims, error)
 	// Sign creates a JWT for c (RFC 7519 §7.1) as a compact JWS (RFC 7515),
 	// signed with the Verifier's key and valid from now for ttl, which must
-	// be positive and at most MaxTTL. It returns the token and its expiry.
+	// be positive and at most MaxTTL. It returns the token, at most
+	// MaxTokenSize bytes, and its expiry.
 	// The token always carries `exp`, so a Verifier accepts it until
 	// it expires and rejects it after. A verify-only Ed25519 Verifier refuses
 	// to sign.
@@ -120,7 +121,15 @@ func NewEd25519Verifier(publicKey ed25519.PublicKey) (Verifier, error) {
 	return &verifier{alg: ed25519Alg, publicKey: publicKey}, nil
 }
 
+// MaxTokenSize is the longest token Sign issues and Verify reads, in bytes.
+// A token travels in a request header and its claims are bound into every
+// transaction, so it must stay small; 8 KiB is several times a typical JWT.
+const MaxTokenSize = 8 << 10
+
 func (v *verifier) Verify(token string) (Claims, error) {
+	if len(token) > MaxTokenSize {
+		return Claims{}, fmt.Errorf("authjwt: token exceeds %d bytes", MaxTokenSize)
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return Claims{}, errors.New("authjwt: malformed token")
@@ -130,7 +139,7 @@ func (v *verifier) Verify(token string) (Claims, error) {
 		return Claims{}, err
 	}
 	if h.Alg != v.alg {
-		return Claims{}, fmt.Errorf("authjwt: signing method %q, want %q", h.Alg, v.alg)
+		return Claims{}, errors.New("authjwt: unsupported alg")
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {

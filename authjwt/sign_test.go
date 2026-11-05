@@ -2,6 +2,8 @@ package authjwt_test
 
 import (
 	"crypto/ed25519"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,6 +179,8 @@ func TestSign_RefusesBadInput(t *testing.T) {
 		"extra iat":     {authjwt.ClaimsSet{Subject: "u", Extra: map[string]any{"iat": 0}}, time.Hour},
 		"extra roles":   {authjwt.ClaimsSet{Subject: "u", Extra: map[string]any{"roles": []string{"admin"}}}, time.Hour},
 		"extra iss":     {authjwt.ClaimsSet{Subject: "u", Issuer: "a", Extra: map[string]any{"iss": "b"}}, time.Hour},
+		"too large":     {authjwt.ClaimsSet{Subject: "u", Extra: map[string]any{"blob": strings.Repeat("x", authjwt.MaxTokenSize)}}, time.Hour},
+		"too many":      {authjwt.ClaimsSet{Subject: "u", Extra: tooManyExtras()}, time.Hour},
 	}
 	v := newVerifier(t)
 	for name, bad := range badInputs {
@@ -189,4 +193,13 @@ func TestSign_RefusesBadInput(t *testing.T) {
 			}
 		})
 	}
+}
+
+// tooManyExtras is one claim over MaxExtraClaims.
+func tooManyExtras() map[string]any {
+	extras := map[string]any{}
+	for i := 0; i <= authjwt.MaxExtraClaims; i++ {
+		extras[fmt.Sprintf("claim_%d", i)] = true
+	}
+	return extras
 }
