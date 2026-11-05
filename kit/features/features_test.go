@@ -48,7 +48,7 @@ const (
 
 const testSecret = "features-test-secret-features-test-0"
 
-func newVerifier(t *testing.T) *authjwt.Verifier {
+func newVerifier(t *testing.T) authjwt.Signer {
 	t.Helper()
 	v, err := authjwt.NewVerifier(testSecret)
 	if err != nil {
@@ -57,18 +57,18 @@ func newVerifier(t *testing.T) *authjwt.Verifier {
 	return v
 }
 
-func TestEmbed_RoundTripsThroughMintAndVerify(t *testing.T) {
+func TestEmbed_RoundTripsThroughSignAndVerify(t *testing.T) {
 	// Given decisions resolved at sign-in, embedded next to another extra
 	v := newVerifier(t)
 	resolved := features.Decisions{
 		orgA:                  {"FLAG_SHEETS": true},
 		features.GlobalBucket: {"FLAG_REPORTS": true},
 	}
-	signIn := authjwt.MintClaims{Subject: "user-1", Extra: map[string]any{"email": "a@b.c"}}
+	signIn := authjwt.ClaimsSet{Subject: "user-1", Extra: map[string]any{"email": "a@b.c"}}
 	resolved.Embed(&signIn)
 
-	// When the token is minted, verified and its decisions read back
-	token, _, err := v.Mint(signIn, time.Hour, time.Now())
+	// When the token is signed, verified and its decisions read back
+	token, _, err := v.Sign(signIn, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestEmbed_RoundTripsThroughMintAndVerify(t *testing.T) {
 
 func TestEmbed_StartsExtraWhenNil(t *testing.T) {
 	// Given claims with no extras
-	var signIn authjwt.MintClaims
+	var signIn authjwt.ClaimsSet
 	// When decisions are embedded
 	features.Decisions{orgA: {"FLAG_SHEETS": true}}.Embed(&signIn)
 	// Then the claim is set
@@ -150,8 +150,8 @@ func TestFromClaims_AbsentClaimHasNoDecisions(t *testing.T) {
 	}
 }
 
-func TestFromClaims_RejectsShapesWeNeverMint(t *testing.T) {
-	// Given features claims of shapes the app never mints
+func TestFromClaims_RejectsShapesWeNeverSign(t *testing.T) {
+	// Given features claims of shapes the app never signs
 	malformedClaims := map[string]any{
 		"not an object":       "FLAG_SHEETS",
 		"bucket not a map":    map[string]any{orgA: "FLAG_SHEETS"},

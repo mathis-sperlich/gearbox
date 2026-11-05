@@ -64,11 +64,11 @@ func serve(t *testing.T, authn connectgear.Authenticator, g *features.Gate[flag]
 	return srv.URL
 }
 
-func tokenWith(t *testing.T, v *authjwt.Verifier, d features.Decisions) string {
+func tokenWith(t *testing.T, v authjwt.Signer, d features.Decisions) string {
 	t.Helper()
-	signIn := authjwt.MintClaims{Subject: "user-1"}
+	signIn := authjwt.ClaimsSet{Subject: "user-1"}
 	d.Embed(&signIn)
-	token, _, err := v.Mint(signIn, time.Hour, time.Now())
+	token, _, err := v.Sign(signIn, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestGate_RefusesPrincipalsWithoutClaims(t *testing.T) {
 }
 
 func TestGate_RefusesMalformedClaim(t *testing.T) {
-	// Given a principal whose features claim isn't the shape the app mints
+	// Given a principal whose features claim isn't the shape the app signs
 	g := newGate(t)
 	malformed := &authjwt.Claims{Subject: "user-1", Raw: map[string]any{features.ClaimName: "FLAG_SHEETS"}}
 	ctx := connectgear.WithPrincipal(context.Background(), malformed)
