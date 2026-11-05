@@ -23,14 +23,21 @@ func inAnHour() int64 { return time.Now().Add(time.Hour).Unix() }
 // HMAC-SHA256-signed with secret, independently of the package under test.
 func signToken(t *testing.T, alg, secret string, claims map[string]any) string {
 	t.Helper()
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	return signPayload(t, alg, secret, payload)
+}
+
+// signPayload signs an already-encoded claims payload, so a test can hand in
+// JSON that no marshaller produces, such as duplicate names.
+func signPayload(t *testing.T, alg, secret string, payload []byte) string {
+	t.Helper()
 	enc := base64.RawURLEncoding
 	header, err := json.Marshal(map[string]string{"alg": alg, "typ": "JWT"})
 	if err != nil {
 		t.Fatalf("marshal header: %v", err)
-	}
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
 	}
 	signingInput := enc.EncodeToString(header) + "." + enc.EncodeToString(payload)
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -90,6 +97,21 @@ func TestAuthJWT_VerifyBearerValidYieldsClaims(t *testing.T) {
 	}
 }
 
+func TestAuthJWT_RolesClaimIsCaseSensitive(t *testing.T) {
+	// Given a token whose only roles-like claim is "Roles", not "roles"
+	v := newVerifier(t)
+	casedRolesToken := signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "Roles": []string{"admin"}, "exp": inAnHour()})
+	// When it is verified
+	claims, err := v.Verify(casedRolesToken)
+	// Then it carries no roles
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if len(claims.Roles) != 0 {
+		t.Fatalf("roles = %v, want none", claims.Roles)
+	}
+}
+
 func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
 	// Given tokens that each break one rule Verify enforces
 	invalidTokens := map[string]string{
@@ -97,6 +119,7 @@ func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
 		"alg none":        signToken(t, "none", testSecret, map[string]any{"sub": "u", "exp": inAnHour()}),
 		"alg HS512":       signToken(t, "HS512", testSecret, map[string]any{"sub": "u", "exp": inAnHour()}),
 		"no sub":          signToken(t, "HS256", testSecret, map[string]any{"roles": []string{"editor"}, "exp": inAnHour()}),
+		"duplicate exp":   signPayload(t, "HS256", testSecret, []byte(`{"sub":"u","exp":1,"exp":4102444800}`)),
 		"no exp":          signToken(t, "HS256", testSecret, map[string]any{"sub": "u"}),
 		"expired":         signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": time.Now().Add(-time.Hour).Unix()}),
 		"not before":      signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour(), "nbf": inAnHour()}),

@@ -21,7 +21,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strconv"
@@ -154,11 +154,10 @@ func (v *verifier) Verify(token string) (Claims, error) {
 	case reg.Subject == "":
 		return Claims{}, errors.New("authjwt: token has no sub claim")
 	}
-	c := Claims{Subject: reg.Subject}
+	c := Claims{Subject: reg.Subject, Roles: reg.Roles}
 	if err := decodeSegment(parts[1], &c.Raw); err != nil {
 		return Claims{}, err
 	}
-	c.Roles = reg.Roles
 	return c, nil
 }
 
@@ -178,7 +177,9 @@ const (
 
 // verifiedClaims are the claims Verify checks or returns typed: the RFC 7519
 // §4.1 Registered Claims it validates plus the roles claim. Every claim, these
-// included, also lands in Claims.Raw.
+// included, also lands in Claims.Raw. Decoded with encoding/json/v2, which
+// matches names case-sensitively and rejects duplicate names, so "Roles" or a
+// second "exp" can't reach these fields.
 type verifiedClaims struct {
 	Subject        string      `json:"sub"`
 	ExpirationTime numericDate `json:"exp"`

@@ -2,7 +2,7 @@ package authjwt
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
@@ -83,7 +83,7 @@ func settingsStatement(ctx context.Context, c *Claims, extra ExtraSettings) (str
 	if raw == nil {
 		raw = map[string]any{"sub": c.Subject}
 	}
-	claimsJSON, err := json.Marshal(raw)
+	claimsJSON, err := json.Marshal(raw, json.Deterministic(true))
 	if err != nil {
 		return "", nil, fmt.Errorf("authjwt: marshal claims: %w", err)
 	}

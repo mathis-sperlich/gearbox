@@ -2,7 +2,7 @@ package authjwt
 
 import (
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
@@ -44,7 +44,7 @@ func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token st
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	payload, err := json.Marshal(claims)
+	payload, err := json.Marshal(claims, json.Deterministic(true))
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("authjwt: sign: %w", err)
 	}
