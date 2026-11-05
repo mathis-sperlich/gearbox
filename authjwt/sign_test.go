@@ -115,25 +115,6 @@ func TestSign_AlgorithmsDoNotCrossVerify(t *testing.T) {
 	}
 }
 
-func TestSign_RolesUseConfiguredClaim(t *testing.T) {
-	// Given a verifier reading roles from app_roles
-	v := newVerifier(t, authjwt.WithRolesClaim("app_roles"))
-	admin := authjwt.ClaimsSet{Subject: "u", Roles: []string{"admin"}}
-	// When an admin token is signed and verified
-	token, _, err := v.Sign(admin, time.Minute, time.Now())
-	if err != nil {
-		t.Fatalf("Sign: %v", err)
-	}
-	claims, err := v.Verify(token)
-	// Then the roles live under app_roles, not roles
-	if err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
-	if len(claims.Roles) != 1 || claims.Roles[0] != "admin" || claims.Raw["roles"] != nil {
-		t.Fatalf("roles = %v raw = %v", claims.Roles, claims.Raw)
-	}
-}
-
 func TestSign_ExtraIssAllowedWithoutIssuer(t *testing.T) {
 	// Given claims that set iss through Extra and leave Issuer empty
 	v := newVerifier(t)

@@ -38,9 +38,9 @@ func signToken(t *testing.T, alg, secret string, claims map[string]any) string {
 	return signingInput + "." + enc.EncodeToString(mac.Sum(nil))
 }
 
-func newVerifier(t *testing.T, opts ...authjwt.Option) authjwt.Verifier {
+func newVerifier(t *testing.T) authjwt.Verifier {
 	t.Helper()
-	v, err := authjwt.NewVerifier(testSecret, opts...)
+	v, err := authjwt.NewVerifier(testSecret)
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}

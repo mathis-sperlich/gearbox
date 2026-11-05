@@ -35,8 +35,7 @@ import (
 type Claims struct {
 	// Subject is the token's `sub` claim — the user/identity ID.
 	Subject string
-	// Roles come from the configured roles claim (default "roles"): a JSON string
-	// array or a single string.
+	// Roles is the token's `roles` claim: a JSON string array.
 	Roles []string
 	// Raw is the full claim set, so a host TxRunner can forward it to its tenancy
 	// layer (e.g. request.jwt.claims for RLS).
@@ -80,16 +79,10 @@ type verifier struct {
 	secret     []byte             // HS256 only
 	publicKey  ed25519.PublicKey  // Ed25519 only
 	privateKey ed25519.PrivateKey // Ed25519 only; nil for a verify-only Verifier
-	rolesClaim string
 }
 
-// Option configures a Verifier.
-type Option func(*verifier)
-
-// WithRolesClaim sets the claim name roles are read from (default "roles").
-func WithRolesClaim(name string) Option {
-	return func(v *verifier) { v.rolesClaim = name }
-}
+// rolesClaim is the claim Sign writes Roles to; verifiedClaims reads it back.
+const rolesClaim = "roles"
 
 // NewVerifier builds an HS256 Verifier from the HMAC signing secret, which
 // must be at least MinSecretSize bytes. It both signs and verifies, so every
@@ -98,42 +91,33 @@ func WithRolesClaim(name string) Option {
 // Deprecated: Use NewEd25519Signer in the service that issues tokens and
 // NewEd25519Verifier, with the matching public key, wherever tokens are only
 // checked. NewVerifier stays for existing HS256 deployments.
-func NewVerifier(secret string, opts ...Option) (Verifier, error) {
+func NewVerifier(secret string) (Verifier, error) {
 	if len(secret) < MinSecretSize {
 		return nil, fmt.Errorf("authjwt: HS256 secret must be at least %d bytes, got %d", MinSecretSize, len(secret))
 	}
-	return newVerifier(&verifier{alg: hs256, secret: []byte(secret)}, opts), nil
+	return &verifier{alg: hs256, secret: []byte(secret)}, nil
 }
 
 // NewEd25519Signer builds a Verifier that signs and verifies Ed25519 tokens
 // with privateKey. Use it in the backend that issues tokens.
-func NewEd25519Signer(privateKey ed25519.PrivateKey, opts ...Option) (Verifier, error) {
+func NewEd25519Signer(privateKey ed25519.PrivateKey) (Verifier, error) {
 	if len(privateKey) != ed25519.PrivateKeySize {
 		return nil, errors.New("authjwt: Ed25519 private key has the wrong size")
 	}
-	v := &verifier{
+	return &verifier{
 		alg:        ed25519Alg,
 		publicKey:  privateKey.Public().(ed25519.PublicKey),
 		privateKey: privateKey,
-	}
-	return newVerifier(v, opts), nil
+	}, nil
 }
 
 // NewEd25519Verifier builds a verify-only Verifier for Ed25519 tokens signed
 // with the private key belonging to publicKey. Sign refuses on it.
-func NewEd25519Verifier(publicKey ed25519.PublicKey, opts ...Option) (Verifier, error) {
+func NewEd25519Verifier(publicKey ed25519.PublicKey) (Verifier, error) {
 	if len(publicKey) != ed25519.PublicKeySize {
 		return nil, errors.New("authjwt: Ed25519 public key has the wrong size")
 	}
-	return newVerifier(&verifier{alg: ed25519Alg, publicKey: publicKey}, opts), nil
-}
-
-func newVerifier(v *verifier, opts []Option) *verifier {
-	v.rolesClaim = "roles"
-	for _, o := range opts {
-		o(v)
-	}
-	return v
+	return &verifier{alg: ed25519Alg, publicKey: publicKey}, nil
 }
 
 func (v *verifier) Verify(token string) (Claims, error) {
@@ -155,7 +139,7 @@ func (v *verifier) Verify(token string) (Claims, error) {
 	if !v.validSignature(parts[0]+"."+parts[1], sig) {
 		return Claims{}, errors.New("authjwt: invalid signature")
 	}
-	var reg registeredClaims
+	var reg verifiedClaims
 	if err := decodeSegment(parts[1], &reg); err != nil {
 		return Claims{}, err
 	}
@@ -174,7 +158,7 @@ func (v *verifier) Verify(token string) (Claims, error) {
 	if err := decodeSegment(parts[1], &c.Raw); err != nil {
 		return Claims{}, err
 	}
-	c.Roles = rolesFrom(c.Raw[v.rolesClaim])
+	c.Roles = reg.Roles
 	return c, nil
 }
 
@@ -192,12 +176,14 @@ const (
 	ed25519Alg algorithm = "Ed25519" // RFC 9864
 )
 
-// registeredClaims holds the RFC 7519 §4.1 Registered Claims Verify checks.
-// Every claim, these included, also lands in Claims.Raw.
-type registeredClaims struct {
+// verifiedClaims are the claims Verify checks or returns typed: the RFC 7519
+// §4.1 Registered Claims it validates plus the roles claim. Every claim, these
+// included, also lands in Claims.Raw.
+type verifiedClaims struct {
 	Subject        string      `json:"sub"`
 	ExpirationTime numericDate `json:"exp"`
 	NotBefore      numericDate `json:"nbf"`
+	Roles          []string    `json:"roles"`
 }
 
 // numericDate is an RFC 7519 NumericDate: seconds since the Unix epoch.
@@ -288,26 +274,4 @@ func RolesOf(p gearbox.Principal) []string {
 		return c.Roles
 	}
 	return nil
-}
-
-func rolesFrom(v any) []string {
-	switch t := v.(type) {
-	case string:
-		if t == "" {
-			return nil
-		}
-		return []string{t}
-	case []any:
-		out := make([]string, 0, len(t))
-		for _, e := range t {
-			if s, ok := e.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	case []string:
-		return t
-	default:
-		return nil
-	}
 }

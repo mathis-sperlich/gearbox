@@ -15,8 +15,7 @@ import (
 type ClaimsSet struct {
 	// Subject becomes `sub`. Required.
 	Subject string
-	// Roles are written under the Verifier's roles claim (default "roles").
-	// Omitted when empty.
+	// Roles become `roles`. Omitted when empty.
 	Roles []string
 	// Issuer becomes `iss` when set.
 	Issuer string
@@ -24,7 +23,7 @@ type ClaimsSet struct {
 	Audience string
 	// Extra carries app-specific claims (email, a Postgres `role`, a features
 	// map, a session id, ...). It may not set a claim Sign owns: sub, iat, exp,
-	// the roles claim, and iss/aud when Issuer/Audience are set.
+	// roles, and iss/aud when Issuer/Audience are set.
 	Extra map[string]any
 }
 
@@ -70,7 +69,7 @@ func (v *verifier) claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, er
 	}
 	reserved := map[string]any{"sub": c.Subject, "iat": iat.Unix(), "exp": exp.Unix()}
 	if len(c.Roles) > 0 {
-		reserved[v.rolesClaim] = c.Roles
+		reserved[rolesClaim] = c.Roles
 	}
 	if c.Issuer != "" {
 		reserved["iss"] = c.Issuer
@@ -80,7 +79,7 @@ func (v *verifier) claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, er
 	}
 	claims := make(map[string]any, len(c.Extra)+len(reserved))
 	for k, val := range c.Extra {
-		if _, owned := reserved[k]; owned || k == v.rolesClaim {
+		if _, owned := reserved[k]; owned || k == rolesClaim {
 			return nil, fmt.Errorf("authjwt: sign: extra claim %q is reserved", k)
 		}
 		claims[k] = val
