@@ -356,3 +356,55 @@ func expiredToken(t *testing.T, v authjwt.Signer) (tok string) {
 	synctest.Test(t, func(t *testing.T) { tok = token(t, v, time.Minute) })
 	return tok
 }
+
+// handlerConn is the least a streaming handler conn needs for an interceptor test.
+type handlerConn struct {
+	connect.StreamingHandlerConn
+	header http.Header
+}
+
+func (c handlerConn) Spec() connect.Spec {
+	return connect.Spec{Procedure: procStream, StreamType: connect.StreamTypeServer}
+}
+func (c handlerConn) RequestHeader() http.Header { return c.header }
+
+func TestAuthInterceptor_StreamEndsWhenTheTokenExpires(t *testing.T) {
+	// Given a stream opened with a token that expires in a minute
+	v := verifier(t, chainSecret)
+	minuteToken, expiresAt, err := v.Sign(authjwt.ClaimsSet{Subject: "user-1"}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := handlerConn{header: http.Header{"Authorization": {"Bearer " + minuteToken}}}
+	var deadline time.Time
+	var hasDeadline bool
+	// When the handler runs
+	err = connectgear.AuthInterceptor(connectgear.Bearer(v)).WrapStreamingHandler(func(ctx context.Context, _ connect.StreamingHandlerConn) error {
+		deadline, hasDeadline = ctx.Deadline()
+		return nil
+	})(context.Background(), conn)
+	// Then its context ends when the token does
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasDeadline || !deadline.Equal(expiresAt.Truncate(time.Second)) {
+		t.Fatalf("deadline = %v (%v), want %v", deadline, hasDeadline, expiresAt)
+	}
+}
+
+func TestAuthInterceptor_StreamWithoutClaimsKeepsItsContext(t *testing.T) {
+	// Given an authenticator whose principal carries no expiry
+	apiKeyAuth := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
+		return "api-key-42", nil
+	}
+	var hasDeadline bool
+	// When a stream handler runs under it
+	err := connectgear.AuthInterceptor(apiKeyAuth).WrapStreamingHandler(func(ctx context.Context, _ connect.StreamingHandlerConn) error {
+		_, hasDeadline = ctx.Deadline()
+		return nil
+	})(context.Background(), handlerConn{})
+	// Then no deadline was added
+	if err != nil || hasDeadline {
+		t.Fatalf("err = %v, hasDeadline = %v", err, hasDeadline)
+	}
+}

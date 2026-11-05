@@ -34,6 +34,9 @@ func TestSign_RoundTripsThroughVerify(t *testing.T) {
 	if until := time.Until(expiresAt); until > time.Hour || until < 59*time.Minute {
 		t.Fatalf("expiresAt = %v, want about an hour out", expiresAt)
 	}
+	if !claims.ExpiresAt.Equal(expiresAt.Truncate(time.Second)) {
+		t.Fatalf("claims.ExpiresAt = %v, want %v", claims.ExpiresAt, expiresAt)
+	}
 	if claims.Subject != "user-1" || len(claims.Roles) != 1 || claims.Roles[0] != "editor" {
 		t.Fatalf("claims = %+v", claims)
 	}

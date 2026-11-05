@@ -22,9 +22,10 @@ import (
 
 // Claims is the verified token, used as the gearbox Principal.
 type Claims struct {
-	Subject string   // `sub`
-	Roles   []string // `roles`
-	Raw     []byte   // the claim set as signed, JSON; bound for RLS (see BindClaims)
+	Subject   string    // `sub`
+	Roles     []string  // `roles`
+	ExpiresAt time.Time // `exp`; a stream opened with the token ends here
+	Raw       []byte    // the claim set as signed, JSON; bound for RLS (see BindClaims)
 }
 
 // Verifier checks tokens of one algorithm and key. Only the New* constructors
@@ -158,7 +159,7 @@ func (v *verifier) verify(token string) (*Claims, error) {
 	case reg.Subject == "":
 		return nil, errors.New("authjwt: token has no sub claim")
 	}
-	return &Claims{Subject: reg.Subject, Roles: reg.Roles, Raw: payload}, nil
+	return &Claims{Subject: reg.Subject, Roles: reg.Roles, ExpiresAt: reg.ExpirationTime.Time, Raw: payload}, nil
 }
 
 type header struct {

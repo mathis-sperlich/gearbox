@@ -105,12 +105,18 @@ func (i *authInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) 
 }
 
 // WrapStreamingHandler never consults PublicProcedures: a stream always needs
-// credentials.
+// credentials. A stream opened with an *authjwt.Claims principal runs under a
+// context that ends when the token expires, so it can't outlive the token.
 func (i *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
 		ctx, err := i.authenticate(ctx, conn.Spec(), conn.RequestHeader())
 		if err != nil {
 			return err
+		}
+		if c, ok := PrincipalFrom(ctx).(*authjwt.Claims); ok && !c.ExpiresAt.IsZero() {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, c.ExpiresAt)
+			defer cancel()
 		}
 		return next(ctx, conn)
 	}
