@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,29 +82,32 @@ func (v *Verifier) Verify(token string) (Claims, error) {
 	if err := decodeSegment(parts[0], &h); err != nil {
 		return Claims{}, err
 	}
-	if h.Alg != "HS256" {
+	if h.Alg != hs256 {
 		return Claims{}, fmt.Errorf("authjwt: signing method %q is not HS256", h.Alg)
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || !hmac.Equal(sig, v.sign(parts[0]+"."+parts[1])) {
+	if err != nil {
+		return Claims{}, fmt.Errorf("authjwt: malformed token: %w", err)
+	}
+	if !hmac.Equal(sig, v.sign(parts[0]+"."+parts[1])) {
 		return Claims{}, errors.New("authjwt: invalid signature")
 	}
-	var reg registered
+	var reg registeredClaims
 	if err := decodeSegment(parts[1], &reg); err != nil {
 		return Claims{}, err
 	}
 	now := time.Now()
 	switch {
-	case reg.Exp == nil && !v.allowNoExp:
+	case reg.ExpirationTime.IsZero() && !v.allowNoExp:
 		return Claims{}, errors.New("authjwt: token has no exp claim")
-	case reg.Exp != nil && !now.Before(time.Unix(int64(*reg.Exp), 0)):
+	case !reg.ExpirationTime.IsZero() && !now.Before(reg.ExpirationTime.Time):
 		return Claims{}, errors.New("authjwt: token is expired")
-	case reg.Nbf != nil && now.Before(time.Unix(int64(*reg.Nbf), 0)):
+	case !reg.NotBefore.IsZero() && now.Before(reg.NotBefore.Time):
 		return Claims{}, errors.New("authjwt: token is not valid yet")
-	case reg.Sub == "":
+	case reg.Subject == "":
 		return Claims{}, errors.New("authjwt: token has no sub claim")
 	}
-	c := Claims{Subject: reg.Sub}
+	c := Claims{Subject: reg.Subject}
 	if err := decodeSegment(parts[1], &c.Raw); err != nil {
 		return Claims{}, err
 	}
@@ -113,15 +117,44 @@ func (v *Verifier) Verify(token string) (Claims, error) {
 
 // header is the JOSE header of the tokens this package signs and accepts.
 type header struct {
-	Alg string `json:"alg"`
+	Alg algorithm `json:"alg"`
 }
 
-// registered holds the claims Verify checks. Every claim, these included,
-// also lands in Claims.Raw.
-type registered struct {
-	Sub string   `json:"sub"`
-	Exp *float64 `json:"exp"`
-	Nbf *float64 `json:"nbf"`
+// algorithm is a JWS "alg" header value (RFC 7518 §3.1).
+type algorithm string
+
+// hs256 is the only algorithm this package signs with and accepts.
+const hs256 algorithm = "HS256"
+
+// registeredClaims holds the RFC 7519 §4.1 Registered Claims Verify checks.
+// Every claim, these included, also lands in Claims.Raw.
+type registeredClaims struct {
+	Subject        string      `json:"sub"`
+	ExpirationTime numericDate `json:"exp"`
+	NotBefore      numericDate `json:"nbf"`
+}
+
+// numericDate is an RFC 7519 NumericDate: seconds since the Unix epoch.
+// An absent or null claim leaves the zero time.Time.
+//
+// Deliberately stricter than RFC 7519, which allows any JSON number
+// (fractions, exponents, negatives): Verify only accepts tokens this package
+// minted, and Mint always writes whole non-negative seconds. Parsing digits
+// only rules out float overflow and keeps every parsed value at or after
+// 1970, so a present claim can never collide with the zero time that means
+// "absent".
+type numericDate struct{ time.Time }
+
+func (d *numericDate) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		return nil
+	}
+	seconds, err := strconv.ParseUint(string(b), 10, 63)
+	if err != nil {
+		return fmt.Errorf("authjwt: NumericDate must be whole non-negative seconds: %w", err)
+	}
+	d.Time = time.Unix(int64(seconds), 0)
+	return nil
 }
 
 // sign returns the HS256 signature of a JWS signing input.

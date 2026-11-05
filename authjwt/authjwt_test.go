@@ -116,6 +116,10 @@ func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
 		"expired":         signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": time.Now().Add(-time.Hour).Unix()}),
 		"not before":      signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour(), "nbf": inAnHour()}),
 		"exp not number":  signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": "tomorrow"}),
+		"exp fractional":  signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": float64(inAnHour()) + 0.5}),
+		"exp exponent":    signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": json.RawMessage(`9.9e10`)}),
+		"exp negative":    signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": -1}),
+		"nbf negative":    signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour(), "nbf": -1}),
 		"unsigned":        "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1In0.",
 		"two segments":    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0",
 		"not base64":      "!!!.!!!.!!!",
@@ -132,6 +136,24 @@ func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
 				t.Fatal("Verify accepted an invalid token")
 			}
 		})
+	}
+}
+
+func TestAuthJWT_TellsUndecodableSignatureFromWrongOne(t *testing.T) {
+	// Given a token signed with another secret, and one whose signature is not base64url
+	v := newVerifier(t)
+	wronglySigned := signToken(t, "HS256", "a-different-secret", map[string]any{"sub": "u", "exp": inAnHour()})
+	signed := signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour()})
+	undecodableSignature := signed[:strings.LastIndex(signed, ".")+1] + "!!!"
+	// When both are verified
+	_, wrongErr := v.Verify(wronglySigned)
+	_, undecodableErr := v.Verify(undecodableSignature)
+	// Then the first is an invalid signature and the second a malformed token
+	if wrongErr == nil || !strings.Contains(wrongErr.Error(), "invalid signature") {
+		t.Fatalf("wrongly signed: err = %v, want invalid signature", wrongErr)
+	}
+	if undecodableErr == nil || !strings.Contains(undecodableErr.Error(), "malformed token") {
+		t.Fatalf("undecodable signature: err = %v, want malformed token", undecodableErr)
 	}
 }
 
