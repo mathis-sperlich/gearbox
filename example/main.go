@@ -2,9 +2,11 @@
 // pool → engine → typed handlers calling gearbox.Run. The workflow logic lives
 // in orders/actions.go; this file is wiring only.
 //
-//	DATABASE_URL=postgres://...  JWT_SECRET=dev-secret  go run ./example
+//	DATABASE_URL=postgres://...  JWT_PUBLIC_KEY=<base64 Ed25519 public key>  go run ./example
 //
-// Then, with a token whose `roles` claim has "clerk" (or "admin"):
+// The example only verifies tokens; whatever issues them holds the matching
+// private key and signs with authjwt.NewEd25519Signer. Then, with a token
+// whose `roles` claim has "clerk" (or "admin"):
 //
 //	id=$(curl -s -XPOST localhost:8080/seed | jq -r .order_id)
 //	curl -s -XPOST localhost:8080/orders.v1.OrdersService/Pay \
@@ -14,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -48,13 +51,15 @@ func main() {
 		Authz: authorize,
 	})
 
-	verifier, err := authjwt.NewVerifier(mustEnv("JWT_SECRET"))
+	publicKey, err := base64.StdEncoding.DecodeString(mustEnv("JWT_PUBLIC_KEY"))
+	must(err)
+	verifier, err := authjwt.NewEd25519Verifier(publicKey)
 	must(err)
 	validator := validate.NewInterceptor() // buf.validate rules, enforced pre-handler
 
 	svc := &ordersServer{eng: eng}
 	path, handler := ordersv1connect.NewOrdersServiceHandler(svc,
-		connect.WithInterceptors(authInterceptor(verifier), validator))
+		connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(verifier)), validator))
 
 	mux := http.NewServeMux()
 	mux.Handle(path, handler)
@@ -116,20 +121,6 @@ func authorize(_ context.Context, p gearbox.Principal, a gearbox.ActionDescripto
 		}
 	}
 	return fmt.Errorf("%w: %q needs role %q", gearbox.ErrUnauthorized, a.Name, a.Role)
-}
-
-// authInterceptor verifies the bearer token and stores the claims as the
-// Principal for handlers to hand to gearbox.
-func authInterceptor(v *authjwt.Verifier) connect.UnaryInterceptorFunc {
-	return func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			claims, err := v.VerifyBearer(req.Header().Get("Authorization"))
-			if err != nil {
-				return nil, connectgear.Err(err)
-			}
-			return next(connectgear.WithPrincipal(ctx, claims), req)
-		}
-	}
 }
 
 // seed creates a customer, a product, and a placed order so the example is
