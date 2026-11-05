@@ -1,11 +1,14 @@
 package authjwt_test
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/mathis-sperlich/gearbox"
 	"github.com/mathis-sperlich/gearbox/authjwt"
@@ -13,31 +16,46 @@ import (
 
 const testSecret = "super-secret-signing-key"
 
-// validExp is an expiry an hour out — tokens need an `exp` by default.
-func validExp() int64 { return time.Now().Add(time.Hour).Unix() }
+// inAnHour is an expiry an hour out — tokens need an `exp` by default.
+func inAnHour() int64 { return time.Now().Add(time.Hour).Unix() }
 
-// mintHS256 signs a token with the given claims using HS256 and secret.
-func mintHS256(t *testing.T, secret string, claims jwt.MapClaims) string {
+// signToken builds a compact JWS with the given alg header and claims,
+// HMAC-SHA256-signed with secret, independently of the package under test.
+func signToken(t *testing.T, alg, secret string, claims map[string]any) string {
 	t.Helper()
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	s, err := tok.SignedString([]byte(secret))
+	enc := base64.RawURLEncoding
+	header, err := json.Marshal(map[string]string{"alg": alg, "typ": "JWT"})
 	if err != nil {
-		t.Fatalf("sign token: %v", err)
+		t.Fatalf("marshal header: %v", err)
 	}
-	return s
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	signingInput := enc.EncodeToString(header) + "." + enc.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signingInput))
+	return signingInput + "." + enc.EncodeToString(mac.Sum(nil))
 }
 
-func TestAuthJWT_VerifyReturnsSubjectAndRoles(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
+func newVerifier(t *testing.T, opts ...authjwt.Option) *authjwt.Verifier {
+	t.Helper()
+	v, err := authjwt.NewVerifier(testSecret, opts...)
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}
-	tok := mintHS256(t, testSecret, jwt.MapClaims{
-		"sub":   "user-1",
-		"roles": []any{"editor", "viewer"},
-		"exp":   validExp(),
+	return v
+}
+
+func TestAuthJWT_VerifyReturnsSubjectAndRoles(t *testing.T) {
+	// Given a token for an editor-and-viewer signed with the verifier's secret
+	v := newVerifier(t)
+	editorToken := signToken(t, "HS256", testSecret, map[string]any{
+		"sub": "user-1", "roles": []string{"editor", "viewer"}, "exp": inAnHour(),
 	})
-	claims, err := v.Verify(tok)
+	// When it is verified
+	claims, err := v.Verify(editorToken)
+	// Then subject, roles and the raw claim set come back
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -47,48 +65,38 @@ func TestAuthJWT_VerifyReturnsSubjectAndRoles(t *testing.T) {
 	if len(claims.Roles) != 2 || claims.Roles[0] != "editor" || claims.Roles[1] != "viewer" {
 		t.Fatalf("Roles = %v, want [editor viewer]", claims.Roles)
 	}
-}
-
-func TestAuthJWT_WrongSecretFails(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-	tok := mintHS256(t, "a-different-secret", jwt.MapClaims{"sub": "user-1"})
-	if _, err := v.Verify(tok); err == nil {
-		t.Fatal("Verify accepted a token signed with the wrong secret")
+	if claims.Raw["sub"] != "user-1" {
+		t.Fatalf("Raw = %v, want sub user-1", claims.Raw)
 	}
 }
 
-func TestAuthJWT_MissingSubFails(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
+func TestAuthJWT_VerifyBearerValidYieldsClaims(t *testing.T) {
+	// Given an admin token in an Authorization header
+	v := newVerifier(t)
+	adminToken := signToken(t, "HS256", testSecret, map[string]any{
+		"sub": "user-7", "roles": []string{"admin"}, "exp": inAnHour(),
+	})
+	// When the header is verified
+	claims, err := v.VerifyBearer("Bearer " + adminToken)
+	// Then the principal carries the subject and its roles
 	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
+		t.Fatalf("VerifyBearer: %v", err)
 	}
-	tok := mintHS256(t, testSecret, jwt.MapClaims{"roles": []any{"editor"}})
-	if _, err := v.Verify(tok); err == nil {
-		t.Fatal("Verify accepted a token with no sub claim")
+	if claims.Subject != "user-7" {
+		t.Fatalf("Subject = %q, want user-7", claims.Subject)
 	}
-}
-
-func TestAuthJWT_MissingExpRejectedByDefault(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-	tok := mintHS256(t, testSecret, jwt.MapClaims{"sub": "user-1"}) // no exp
-	if _, err := v.Verify(tok); err == nil {
-		t.Fatal("Verify accepted a token without an exp claim")
+	if roles := authjwt.RolesOf(claims); len(roles) != 1 || roles[0] != "admin" {
+		t.Fatalf("RolesOf = %v, want [admin]", roles)
 	}
 }
 
 func TestAuthJWT_MissingExpAllowedWithOption(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret, authjwt.AllowMissingExpiration())
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-	tok := mintHS256(t, testSecret, jwt.MapClaims{"sub": "user-1"}) // no exp
-	claims, err := v.Verify(tok)
+	// Given a verifier that allows exp-less tokens, and such a token
+	v := newVerifier(t, authjwt.AllowMissingExpiration())
+	noExpToken := signToken(t, "HS256", testSecret, map[string]any{"sub": "user-1"})
+	// When it is verified
+	claims, err := v.Verify(noExpToken)
+	// Then it is accepted
 	if err != nil {
 		t.Fatalf("Verify with AllowMissingExpiration: %v", err)
 	}
@@ -97,66 +105,50 @@ func TestAuthJWT_MissingExpAllowedWithOption(t *testing.T) {
 	}
 }
 
-func TestAuthJWT_ExpiredTokenRejected(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
+func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
+	// Given tokens that each break one rule Verify enforces
+	invalidTokens := map[string]string{
+		"wrong secret":    signToken(t, "HS256", "a-different-secret", map[string]any{"sub": "u", "exp": inAnHour()}),
+		"alg none":        signToken(t, "none", testSecret, map[string]any{"sub": "u", "exp": inAnHour()}),
+		"alg HS512":       signToken(t, "HS512", testSecret, map[string]any{"sub": "u", "exp": inAnHour()}),
+		"no sub":          signToken(t, "HS256", testSecret, map[string]any{"roles": []string{"editor"}, "exp": inAnHour()}),
+		"no exp":          signToken(t, "HS256", testSecret, map[string]any{"sub": "u"}),
+		"expired":         signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": time.Now().Add(-time.Hour).Unix()}),
+		"not before":      signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour(), "nbf": inAnHour()}),
+		"exp not number":  signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": "tomorrow"}),
+		"unsigned":        "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1In0.",
+		"two segments":    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0",
+		"not base64":      "!!!.!!!.!!!",
+		"empty":           "",
+		"tampered claims": tamper(signToken(t, "HS256", testSecret, map[string]any{"sub": "u", "exp": inAnHour()})),
 	}
-	tok := mintHS256(t, testSecret, jwt.MapClaims{
-		"sub": "user-1",
-		"exp": time.Now().Add(-time.Hour).Unix(), // already expired
-	})
-	if _, err := v.Verify(tok); err == nil {
-		t.Fatal("Verify accepted an expired token")
+	v := newVerifier(t)
+	for name, invalidToken := range invalidTokens {
+		t.Run(name, func(t *testing.T) {
+			// When it is verified
+			_, err := v.Verify(invalidToken)
+			// Then it is refused
+			if err == nil {
+				t.Fatal("Verify accepted an invalid token")
+			}
+		})
 	}
 }
 
-func TestAuthJWT_AlgNoneRejected(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-	// Build an unsigned "alg: none" token explicitly.
-	tok := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{"sub": "user-1"})
-	signed, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
-	if err != nil {
-		t.Fatalf("sign none-token: %v", err)
-	}
-	if _, err := v.Verify(signed); err == nil {
-		t.Fatal("Verify accepted an alg=none token")
-	}
+// tamper swaps a token's claims for an admin's, keeping the original signature.
+func tamper(token string) string {
+	parts := strings.Split(token, ".")
+	parts[1] = base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"admin","exp":99999999999}`))
+	return strings.Join(parts, ".")
 }
 
 func TestAuthJWT_VerifyBearerNoHeaderUnauthenticated(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-	_, err = v.VerifyBearer("")
+	// Given a request without an Authorization header
+	v := newVerifier(t)
+	// When the empty header is verified
+	_, err := v.VerifyBearer("")
+	// Then the caller is unauthenticated
 	if !errors.Is(err, gearbox.ErrUnauthenticated) {
 		t.Fatalf("err = %v, want ErrUnauthenticated", err)
-	}
-}
-
-func TestAuthJWT_VerifyBearerValidYieldsClaims(t *testing.T) {
-	v, err := authjwt.NewVerifier(testSecret)
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-	tok := mintHS256(t, testSecret, jwt.MapClaims{
-		"sub":   "user-7",
-		"roles": []any{"admin"},
-		"exp":   validExp(),
-	})
-	claims, err := v.VerifyBearer("Bearer " + tok)
-	if err != nil {
-		t.Fatalf("VerifyBearer: %v", err)
-	}
-	if claims.Subject != "user-7" {
-		t.Fatalf("Subject = %q, want user-7", claims.Subject)
-	}
-	roles := authjwt.RolesOf(claims)
-	if len(roles) != 1 || roles[0] != "admin" {
-		t.Fatalf("RolesOf = %v, want [admin]", roles)
 	}
 }

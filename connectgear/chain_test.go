@@ -76,9 +76,9 @@ func serve(t *testing.T, s *seen, opts connect.HandlerOption) string {
 	return srv.URL
 }
 
-func verifier(t *testing.T) *authjwt.Verifier {
+func verifier(t *testing.T, secret string) *authjwt.Verifier {
 	t.Helper()
-	v, err := authjwt.NewVerifier(chainSecret)
+	v, err := authjwt.NewVerifier(secret)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,209 +127,224 @@ func subjectOf(p gearbox.Principal) string {
 	return ""
 }
 
-func TestAuthInterceptor_UnaryAndStreamShareOneAuthPath(t *testing.T) {
-	v := verifier(t)
-	s := &seen{}
-	base := serve(t, s, connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(v))))
-	now := time.Now()
-	good := token(t, v, time.Hour, now)
-	expired := token(t, v, time.Minute, now.Add(-time.Hour))
-	forged := token(t, mustVerifier(t, "another-secret-another-secret-0000"), time.Hour, now)
-
-	for name, do := range map[string]func(string) error{
-		"unary":  func(b string) error { return call(t, base, procEcho, b) },
-		"stream": func(b string) error { return callStream(t, base, procStream, b) },
-	} {
-		for _, bad := range []struct{ what, bearer string }{{"none", ""}, {"expired", expired}, {"forged", forged}, {"garbage", "x.y.z"}} {
-			if err := do(bad.bearer); connect.CodeOf(err) != connect.CodeUnauthenticated {
-				t.Errorf("%s, %s token: err = %v, want unauthenticated", name, bad.what, err)
-			}
-		}
-		if err := do(good); err != nil {
-			t.Fatalf("%s, valid token: %v", name, err)
-		}
-	}
-	n, who := s.snapshot()
-	if n != 2 || subjectOf(who[0]) != "user-1" || subjectOf(who[1]) != "user-1" {
-		t.Fatalf("handler calls %d, principals %v; want 2 calls as user-1", n, who)
+// callKinds runs one call per kind of handler, unary and server stream, so a
+// test checks that both take the same path.
+func callKinds(t *testing.T, base string) map[string]func(bearer string) error {
+	return map[string]func(string) error{
+		"unary":  func(bearer string) error { return call(t, base, procEcho, bearer) },
+		"stream": func(bearer string) error { return callStream(t, base, procStream, bearer) },
 	}
 }
 
-func mustVerifier(t *testing.T, secret string) *authjwt.Verifier {
-	t.Helper()
-	v, err := authjwt.NewVerifier(secret)
-	if err != nil {
-		t.Fatal(err)
+func TestAuthInterceptor_ValidTokenReachesHandlerAsPrincipal(t *testing.T) {
+	// Given handlers behind bearer auth and a valid token for user-1
+	v := verifier(t, chainSecret)
+	handlers := &seen{}
+	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(v))))
+	validToken := token(t, v, time.Hour, time.Now())
+	for kind, callWith := range callKinds(t, base) {
+		// When a unary call and a stream are made with it
+		if err := callWith(validToken); err != nil {
+			t.Fatalf("%s, valid token: %v", kind, err)
+		}
 	}
-	return v
+	// Then both handlers ran as user-1
+	n, principals := handlers.snapshot()
+	if n != 2 || subjectOf(principals[0]) != "user-1" || subjectOf(principals[1]) != "user-1" {
+		t.Fatalf("handler calls %d, principals %v; want 2 calls as user-1", n, principals)
+	}
 }
 
-// Public procedures skip auth for unary calls only; a stream named public
-// still needs credentials (fail closed).
 func TestAuthInterceptor_PublicProceduresAreUnaryOnly(t *testing.T) {
-	s := &seen{}
-	authn := connectgear.Bearer(verifier(t))
-	base := serve(t, s, connectgear.Options(connectgear.AuthInterceptor(authn, connectgear.PublicProcedures(procPublic, procStream))))
-	if err := call(t, base, procPublic, ""); err != nil {
-		t.Fatalf("public unary without credentials: %v", err)
+	// Given a public unary procedure and a stream wrongly listed as public
+	handlers := &seen{}
+	authn := connectgear.Bearer(verifier(t, chainSecret))
+	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(authn, connectgear.PublicProcedures(procPublic, procStream))))
+	// When each is called without credentials
+	publicErr := call(t, base, procPublic, "")
+	privateErr := call(t, base, procEcho, "")
+	streamErr := callStream(t, base, procStream, "")
+	// Then only the public unary call runs, anonymously; the stream fails closed
+	if publicErr != nil {
+		t.Fatalf("public unary without credentials: %v", publicErr)
 	}
-	if err := call(t, base, procEcho, ""); connect.CodeOf(err) != connect.CodeUnauthenticated {
-		t.Fatalf("non-public unary without credentials: err = %v", err)
+	if connect.CodeOf(privateErr) != connect.CodeUnauthenticated {
+		t.Fatalf("non-public unary without credentials: err = %v", privateErr)
 	}
-	if err := callStream(t, base, procStream, ""); connect.CodeOf(err) != connect.CodeUnauthenticated {
-		t.Fatalf("stream listed as public, no credentials: err = %v, want unauthenticated", err)
+	if connect.CodeOf(streamErr) != connect.CodeUnauthenticated {
+		t.Fatalf("stream listed as public, no credentials: err = %v, want unauthenticated", streamErr)
 	}
-	if n, who := s.snapshot(); n != 1 || who[0] != nil {
-		t.Fatalf("handler calls %d, principals %v; want only the public call, anonymous", n, who)
+	if n, principals := handlers.snapshot(); n != 1 || principals[0] != nil {
+		t.Fatalf("handler calls %d, principals %v; want only the public call, anonymous", n, principals)
 	}
 }
 
-// The Authenticator sees the spec, and its errors are mapped: a Connect error
-// passes as is, a gearbox sentinel through Err, anything else is internal with
-// its text withheld; no principal and no error is a refusal.
-func TestAuthInterceptor_AuthenticatorResults(t *testing.T) {
+func TestAuthInterceptor_AuthenticatorSeesStreamType(t *testing.T) {
+	// Given an Authenticator that records the stream type and admits "svc"
 	var mu sync.Mutex
-	var specs []connect.StreamType
-	var result func() (gearbox.Principal, error)
-	authn := func(_ context.Context, spec connect.Spec, _ http.Header) (gearbox.Principal, error) {
+	var streamTypes []connect.StreamType
+	recordingAuthn := func(_ context.Context, spec connect.Spec, _ http.Header) (gearbox.Principal, error) {
 		mu.Lock()
-		specs = append(specs, spec.StreamType)
-		mu.Unlock()
-		return result()
+		defer mu.Unlock()
+		streamTypes = append(streamTypes, spec.StreamType)
+		return "svc", nil
 	}
-	s := &seen{}
-	base := serve(t, s, connectgear.Options(connectgear.AuthInterceptor(authn)))
-
-	cases := []struct {
-		name string
-		res  func() (gearbox.Principal, error)
-		want connect.Code
-	}{
-		{"connect error", func() (gearbox.Principal, error) {
-			return nil, connect.NewError(connect.CodePermissionDenied, errors.New("nope"))
-		}, connect.CodePermissionDenied},
-		{"sentinel", func() (gearbox.Principal, error) { return nil, gearbox.ErrUnauthenticated }, connect.CodeUnauthenticated},
-		{"raw", func() (gearbox.Principal, error) { return nil, errors.New("select secret") }, connect.CodeInternal},
-		{"nil nil", func() (gearbox.Principal, error) { return nil, nil }, connect.CodeUnauthenticated},
-	}
-	for _, c := range cases {
-		result = c.res
-		for kind, err := range map[string]error{"unary": call(t, base, procEcho, ""), "stream": callStream(t, base, procStream, "")} {
-			if connect.CodeOf(err) != c.want {
-				t.Errorf("%s/%s: err = %v, want %v", c.name, kind, err, c.want)
-			}
-			if err != nil && strings.Contains(err.Error(), "select secret") {
-				t.Errorf("%s/%s: raw error reached the client: %v", c.name, kind, err)
-			}
-		}
-	}
-	if n, _ := s.snapshot(); n != 0 {
-		t.Fatalf("handler ran %d times for refused calls", n)
-	}
-
-	result = func() (gearbox.Principal, error) { return "svc", nil }
-	mu.Lock()
-	specs = nil
-	mu.Unlock()
+	handlers := &seen{}
+	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(recordingAuthn)))
+	// When a stream and then a unary call are made
 	if err := callStream(t, base, procStream, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := call(t, base, procEcho, ""); err != nil {
 		t.Fatal(err)
 	}
+	// Then the Authenticator saw each stream type and the handlers ran as svc
 	mu.Lock()
 	defer mu.Unlock()
-	if len(specs) != 2 || specs[0] != connect.StreamTypeServer || specs[1] != connect.StreamTypeUnary {
-		t.Fatalf("authenticator saw stream types %v", specs)
+	if len(streamTypes) != 2 || streamTypes[0] != connect.StreamTypeServer || streamTypes[1] != connect.StreamTypeUnary {
+		t.Fatalf("authenticator saw stream types %v", streamTypes)
 	}
-	if _, who := s.snapshot(); who[0] != gearbox.Principal("svc") || who[1] != gearbox.Principal("svc") {
-		t.Fatalf("principals %v", who)
+	if _, principals := handlers.snapshot(); principals[0] != gearbox.Principal("svc") || principals[1] != gearbox.Principal("svc") {
+		t.Fatalf("principals %v", principals)
 	}
 }
 
-// On a client the interceptor is inert: it neither authenticates nor
-// strips anything.
 func TestAuthInterceptor_PassesClientCallsThrough(t *testing.T) {
-	called := false
-	authn := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
-		called = true
+	// Given the auth interceptor on a client, with an Authenticator that must not run
+	authnRan := false
+	refusingAuthn := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
+		authnRan = true
 		return nil, errors.New("must not run")
 	}
-	s := &seen{}
-	base := serve(t, s, connectgear.Options())
-	ic := connectgear.AuthInterceptor(authn)
-	client := connect.NewClient[str, str](http.DefaultClient, base+procEcho, connect.WithInterceptors(ic))
-	if _, err := client.CallUnary(context.Background(), connect.NewRequest(wrapperspb.String("x"))); err != nil {
-		t.Fatal(err)
-	}
-	sc := connect.NewClient[str, str](http.DefaultClient, base+procStream, connect.WithInterceptors(ic))
-	st, err := sc.CallServerStream(context.Background(), connect.NewRequest(wrapperspb.String("x")))
+	base := serve(t, &seen{}, connectgear.Options())
+	clientInterceptor := connect.WithInterceptors(connectgear.AuthInterceptor(refusingAuthn))
+	// When the client makes a unary call and a stream
+	unaryClient := connect.NewClient[str, str](http.DefaultClient, base+procEcho, clientInterceptor)
+	_, unaryErr := unaryClient.CallUnary(context.Background(), connect.NewRequest(wrapperspb.String("x")))
+	streamClient := connect.NewClient[str, str](http.DefaultClient, base+procStream, clientInterceptor)
+	stream, err := streamClient.CallServerStream(context.Background(), connect.NewRequest(wrapperspb.String("x")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for st.Receive() {
+	for stream.Receive() {
 	}
-	if err := st.Err(); err != nil {
-		t.Fatal(err)
+	_ = stream.Close()
+	// Then both go through and the Authenticator never ran
+	if unaryErr != nil || stream.Err() != nil {
+		t.Fatalf("unary err = %v, stream err = %v", unaryErr, stream.Err())
 	}
-	_ = st.Close()
-	if called {
+	if authnRan {
 		t.Fatal("authenticator ran on a client call")
 	}
 }
 
-// A panicking handler comes back as internal with the panic withheld, unary
-// and stream alike, and the hook sees the value and stack.
-func TestRecover_WithholdsThePanic(t *testing.T) {
-	var mu sync.Mutex
-	var got []string
-	opts := connect.WithHandlerOptions(
-		connect.WithInterceptors(connectgear.AuthInterceptor(func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
-			return "u", nil
-		})),
-		connectgear.Recover(func(_ context.Context, spec connect.Spec, v any, stack []byte) {
-			mu.Lock()
-			defer mu.Unlock()
-			if len(stack) == 0 {
-				t.Error("empty stack")
+func TestAuthInterceptor_RefusesBadTokens(t *testing.T) {
+	// Given handlers behind bearer auth and tokens it must refuse
+	v := verifier(t, chainSecret)
+	handlers := &seen{}
+	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(v))))
+	now := time.Now()
+	badTokens := map[string]string{
+		"none":    "",
+		"expired": token(t, v, time.Minute, now.Add(-time.Hour)),
+		"forged":  token(t, verifier(t, "another-secret-another-secret-0000"), time.Hour, now),
+		"garbage": "x.y.z",
+	}
+	for kind, callWith := range callKinds(t, base) {
+		for name, badToken := range badTokens {
+			// When a call is made with it
+			err := callWith(badToken)
+			// Then it is unauthenticated
+			if connect.CodeOf(err) != connect.CodeUnauthenticated {
+				t.Errorf("%s, %s token: err = %v, want unauthenticated", kind, name, err)
 			}
-			got = append(got, spec.Procedure+" "+v.(string))
-		}),
-	)
-	base := serve(t, &seen{}, opts)
-	for name, err := range map[string]error{"unary": call(t, base, procPanic, ""), "stream": callStream(t, base, procSPanic, "")} {
-		if connect.CodeOf(err) != connect.CodeInternal {
-			t.Errorf("%s: err = %v, want internal", name, err)
-		}
-		if err != nil && (strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "relation")) {
-			t.Errorf("%s: the panic reached the client: %v", name, err)
 		}
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(got) != 2 {
-		t.Fatalf("hook calls %v", got)
+	// And no handler ran
+	if n, _ := handlers.snapshot(); n != 0 {
+		t.Fatalf("handler ran %d times for refused calls", n)
 	}
 }
 
-// Options caps what a handler reads: one byte over the limit is
-// resource_exhausted before the handler runs.
+func TestAuthInterceptor_MapsAuthenticatorRefusals(t *testing.T) {
+	// Given Authenticator refusals and the code each must reach the client as
+	type refusal struct {
+		principal gearbox.Principal
+		err       error
+		wantCode  connect.Code
+	}
+	refusals := map[string]refusal{
+		"connect error passes as is":        {nil, connect.NewError(connect.CodePermissionDenied, errors.New("nope")), connect.CodePermissionDenied},
+		"gearbox sentinel maps through Err": {nil, gearbox.ErrUnauthenticated, connect.CodeUnauthenticated},
+		"raw error is internal, withheld":   {nil, errors.New("select secret"), connect.CodeInternal},
+		"no principal, no error refuses":    {nil, nil, connect.CodeUnauthenticated},
+	}
+	for name, r := range refusals {
+		t.Run(name, func(t *testing.T) {
+			refusingAuthn := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
+				return r.principal, r.err
+			}
+			handlers := &seen{}
+			base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(refusingAuthn)))
+			for kind, callWith := range callKinds(t, base) {
+				// When a call is made
+				err := callWith("")
+				// Then it gets the mapped code and never the raw error text
+				if connect.CodeOf(err) != r.wantCode {
+					t.Errorf("%s: err = %v, want %v", kind, err, r.wantCode)
+				}
+				if err != nil && strings.Contains(err.Error(), "select secret") {
+					t.Errorf("%s: raw error reached the client: %v", kind, err)
+				}
+			}
+			// And no handler ran
+			if n, _ := handlers.snapshot(); n != 0 {
+				t.Fatalf("handler ran %d times for refused calls", n)
+			}
+		})
+	}
+}
+
+func TestOptions_WithholdsHandlerPanics(t *testing.T) {
+	// Given handlers that panic with secrets in the panic value
+	admitAll := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) { return "u", nil }
+	base := serve(t, &seen{}, connectgear.Options(connectgear.AuthInterceptor(admitAll)))
+	// When the unary and the streaming one are called
+	panicErrs := map[string]error{"unary": call(t, base, procPanic, ""), "stream": callStream(t, base, procSPanic, "")}
+	// Then each comes back internal with the panic withheld
+	for kind, err := range panicErrs {
+		if connect.CodeOf(err) != connect.CodeInternal {
+			t.Errorf("%s: err = %v, want internal", kind, err)
+		}
+		if err != nil && (strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "relation")) {
+			t.Errorf("%s: the panic reached the client: %v", kind, err)
+		}
+	}
+}
+
 func TestOptions_LimitsTheRequestSize(t *testing.T) {
+	// Given a public handler mounted with Options and a request at the limit
+	handlers := &seen{}
+	authn := connectgear.Bearer(verifier(t, chainSecret))
+	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(authn, connectgear.PublicProcedures(procPublic))))
+	client := connect.NewClient[str, str](http.DefaultClient, base+procPublic)
+	// A StringValue of n bytes encodes as n+tag+varint(n) bytes, so this is over.
+	overLimit := strings.Repeat("a", connectgear.DefaultMaxRequestBytes)
+	// When the over-size request and a small one are sent
+	_, overErr := client.CallUnary(context.Background(), connect.NewRequest(wrapperspb.String(overLimit)))
+	callsAfterOver, _ := handlers.snapshot()
+	_, smallErr := client.CallUnary(context.Background(), connect.NewRequest(wrapperspb.String(overLimit[:1024])))
+	// Then the over-size one is resource_exhausted before the handler runs
+	if connect.CodeOf(overErr) != connect.CodeResourceExhausted {
+		t.Fatalf("over-size: err = %v, want resource_exhausted", overErr)
+	}
+	if callsAfterOver != 0 {
+		t.Fatalf("handler ran %d times for an over-size request", callsAfterOver)
+	}
+	if smallErr != nil {
+		t.Fatalf("small request: %v", smallErr)
+	}
 	if connectgear.DefaultMaxRequestBytes != 8<<20 {
 		t.Fatalf("DefaultMaxRequestBytes = %d", connectgear.DefaultMaxRequestBytes)
-	}
-	s := &seen{}
-	base := serve(t, s, connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(verifier(t)), connectgear.PublicProcedures(procPublic))))
-	client := connect.NewClient[str, str](http.DefaultClient, base+procPublic)
-	// A StringValue of n bytes encodes as n+tag+varint(n) bytes.
-	big := strings.Repeat("a", connectgear.DefaultMaxRequestBytes)
-	if _, err := client.CallUnary(context.Background(), connect.NewRequest(wrapperspb.String(big))); connect.CodeOf(err) != connect.CodeResourceExhausted {
-		t.Fatalf("over-size: err = %v, want resource_exhausted", err)
-	}
-	if n, _ := s.snapshot(); n != 0 {
-		t.Fatalf("handler ran %d times for an over-size request", n)
-	}
-	if _, err := client.CallUnary(context.Background(), connect.NewRequest(wrapperspb.String(big[:1024]))); err != nil {
-		t.Fatalf("small request: %v", err)
 	}
 }

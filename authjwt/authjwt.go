@@ -7,11 +7,15 @@
 package authjwt
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/mathis-sperlich/gearbox"
 )
 
@@ -62,33 +66,80 @@ func NewVerifier(secret string, opts ...Option) (*Verifier, error) {
 }
 
 // Verify parses and validates a token string, returning its Claims.
+//
+// The token must be a compact HS256 JWS signed with the Verifier's secret
+// (any other alg, including "none", is refused; the signature is compared in
+// constant time). `exp` must lie in the future (required unless
+// AllowMissingExpiration), `nbf`, when present, in the past, and `sub` must
+// be a non-empty string.
 func (v *Verifier) Verify(token string) (Claims, error) {
-	parserOpts := []jwt.ParserOption{jwt.WithValidMethods([]string{"HS256"})}
-	if !v.allowNoExp {
-		parserOpts = append(parserOpts, jwt.WithExpirationRequired())
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return Claims{}, errors.New("authjwt: malformed token")
 	}
-	parsed, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method %v", t.Header["alg"])
-		}
-		return v.secret, nil
-	}, parserOpts...)
-	if err != nil {
+	var h header
+	if err := decodeSegment(parts[0], &h); err != nil {
 		return Claims{}, err
 	}
-	mc, ok := parsed.Claims.(jwt.MapClaims)
-	if !ok || !parsed.Valid {
-		return Claims{}, errors.New("authjwt: invalid token")
+	if h.Alg != "HS256" {
+		return Claims{}, fmt.Errorf("authjwt: signing method %q is not HS256", h.Alg)
 	}
-	c := Claims{Raw: mc}
-	if sub, ok := mc["sub"].(string); ok {
-		c.Subject = sub
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(sig, v.sign(parts[0]+"."+parts[1])) {
+		return Claims{}, errors.New("authjwt: invalid signature")
 	}
-	if c.Subject == "" {
+	var reg registered
+	if err := decodeSegment(parts[1], &reg); err != nil {
+		return Claims{}, err
+	}
+	now := time.Now()
+	switch {
+	case reg.Exp == nil && !v.allowNoExp:
+		return Claims{}, errors.New("authjwt: token has no exp claim")
+	case reg.Exp != nil && !now.Before(time.Unix(int64(*reg.Exp), 0)):
+		return Claims{}, errors.New("authjwt: token is expired")
+	case reg.Nbf != nil && now.Before(time.Unix(int64(*reg.Nbf), 0)):
+		return Claims{}, errors.New("authjwt: token is not valid yet")
+	case reg.Sub == "":
 		return Claims{}, errors.New("authjwt: token has no sub claim")
 	}
-	c.Roles = rolesFrom(mc[v.rolesClaim])
+	c := Claims{Subject: reg.Sub}
+	if err := decodeSegment(parts[1], &c.Raw); err != nil {
+		return Claims{}, err
+	}
+	c.Roles = rolesFrom(c.Raw[v.rolesClaim])
 	return c, nil
+}
+
+// header is the JOSE header of the tokens this package signs and accepts.
+type header struct {
+	Alg string `json:"alg"`
+}
+
+// registered holds the claims Verify checks. Every claim, these included,
+// also lands in Claims.Raw.
+type registered struct {
+	Sub string   `json:"sub"`
+	Exp *float64 `json:"exp"`
+	Nbf *float64 `json:"nbf"`
+}
+
+// sign returns the HS256 signature of a JWS signing input.
+func (v *Verifier) sign(signingInput string) []byte {
+	mac := hmac.New(sha256.New, v.secret)
+	mac.Write([]byte(signingInput))
+	return mac.Sum(nil)
+}
+
+func decodeSegment(seg string, into any) error {
+	b, err := base64.RawURLEncoding.DecodeString(seg)
+	if err == nil {
+		err = json.Unmarshal(b, into)
+	}
+	if err != nil {
+		return fmt.Errorf("authjwt: malformed token: %w", err)
+	}
+	return nil
 }
 
 // VerifyBearer verifies an "Authorization" header value ("Bearer <token>"),

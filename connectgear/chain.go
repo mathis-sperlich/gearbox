@@ -118,25 +118,19 @@ func (i *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc
 // A larger one is refused as resource_exhausted with no other work.
 const DefaultMaxRequestBytes = 8 << 20
 
-// Recover is a handler option that turns a handler panic into CodeInternal
-// with the panic withheld from the client (its text can carry SQL or
-// secrets). onPanic observes the value and stack; nil logs them with
-// slog.ErrorContext.
-func Recover(onPanic func(ctx context.Context, spec connect.Spec, value any, stack []byte)) connect.HandlerOption {
+// recoverPanics turns a handler panic into CodeInternal with the panic
+// withheld from the client (its text can carry SQL or secrets), and logs the
+// value and stack with slog.ErrorContext.
+func recoverPanics() connect.HandlerOption {
 	return connect.WithRecover(func(ctx context.Context, spec connect.Spec, _ http.Header, p any) error {
-		stack := debug.Stack()
-		if onPanic != nil {
-			onPanic(ctx, spec, p, stack)
-		} else {
-			slog.ErrorContext(ctx, "connectgear: handler panicked", "procedure", spec.Procedure, "panic", p, "stack", string(stack))
-		}
+		slog.ErrorContext(ctx, "connectgear: handler panicked", "procedure", spec.Procedure, "panic", p, "stack", string(debug.Stack()))
 		return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 	})
 }
 
 // Options is the option every handler of a service is mounted with: the
 // interceptors in the order given (first is outermost), a
-// DefaultMaxRequestBytes read limit, and Recover(nil) innermost, so a panic
+// DefaultMaxRequestBytes read limit, and panic recovery innermost, so a panic
 // comes back through the interceptors as an ordinary internal error. A service
 // with larger legitimate requests mounts with its own connect.WithReadMaxBytes
 // after Options, which wins.
@@ -149,6 +143,6 @@ func Options(interceptors ...connect.Interceptor) connect.HandlerOption {
 	return connect.WithHandlerOptions(
 		connect.WithInterceptors(interceptors...),
 		connect.WithReadMaxBytes(DefaultMaxRequestBytes),
-		Recover(nil),
+		recoverPanics(),
 	)
 }
