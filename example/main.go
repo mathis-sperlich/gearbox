@@ -2,9 +2,11 @@
 // pool → engine → typed handlers calling gearbox.Run. The workflow logic lives
 // in orders/actions.go; this file is wiring only.
 //
-//	DATABASE_URL=postgres://...  JWT_SECRET=dev-secret  go run ./example
+//	DATABASE_URL=postgres://...  JWT_PUBLIC_KEY=<base64 Ed25519 public key>  go run ./example
 //
-// Then, with a token whose `roles` claim has "clerk" (or "admin"):
+// The example only verifies tokens; whatever issues them holds the matching
+// private key and signs with authjwt.NewEd25519Signer. Then, with a token
+// whose `roles` claim has "clerk" (or "admin"):
 //
 //	id=$(curl -s -XPOST localhost:8080/seed | jq -r .order_id)
 //	curl -s -XPOST localhost:8080/orders.v1.OrdersService/Pay \
@@ -14,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -48,7 +51,9 @@ func main() {
 		Authz: authorize,
 	})
 
-	verifier, err := authjwt.NewVerifier(mustEnv("JWT_SECRET"))
+	publicKey, err := base64.StdEncoding.DecodeString(mustEnv("JWT_PUBLIC_KEY"))
+	must(err)
+	verifier, err := authjwt.NewEd25519Verifier(publicKey)
 	must(err)
 	validator := validate.NewInterceptor() // buf.validate rules, enforced pre-handler
 

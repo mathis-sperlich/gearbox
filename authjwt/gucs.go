@@ -15,6 +15,27 @@ import (
 	"github.com/mathis-sperlich/gearbox"
 )
 
+// This file hands the caller's identity to Postgres so row-level security can
+// enforce it.
+//
+// Postgres keeps its configuration in GUCs ("Grand Unified Configuration"
+// settings): named string values such as search_path or role. Besides the
+// built-in ones, any name containing a dot (e.g. request.jwt.claims) is a
+// custom setting an application may set and read. set_config(name, value,
+// true) sets one for the current transaction only, and
+// current_setting(name, true) reads it back.
+//
+// That is how the identity of the request reaches the database: BindClaims
+// writes the verified claims into a transaction-local setting before any
+// query runs, and RLS policies read it, e.g.
+//
+//	using (owner_id = (current_setting('request.jwt.claims', true)::jsonb ->> 'sub'))
+//
+// So every query in the transaction is filtered for that caller without the
+// application passing a user id to each one, and the value disappears at
+// COMMIT/ROLLBACK, so a pooled connection never carries one caller's identity
+// into the next caller's transaction.
+
 // ClaimsSetting is the transaction-local Postgres setting BindClaims writes
 // the caller's claims to, as a JSON object. RLS policies read it back with
 // current_setting('request.jwt.claims', true)::jsonb.
