@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
@@ -76,7 +77,7 @@ func serve(t *testing.T, s *seen, opts connect.HandlerOption) string {
 	return srv.URL
 }
 
-func verifier(t *testing.T, secret string) authjwt.Verifier {
+func verifier(t *testing.T, secret string) authjwt.Signer {
 	t.Helper()
 	v, err := authjwt.NewVerifier(secret)
 	if err != nil {
@@ -85,9 +86,9 @@ func verifier(t *testing.T, secret string) authjwt.Verifier {
 	return v
 }
 
-func token(t *testing.T, v authjwt.Verifier, ttl time.Duration, now time.Time) string {
+func token(t *testing.T, v authjwt.Signer, ttl time.Duration) string {
 	t.Helper()
-	tok, _, err := v.Sign(authjwt.ClaimsSet{Subject: "user-1"}, ttl, now)
+	tok, _, err := v.Sign(authjwt.ClaimsSet{Subject: "user-1"}, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +142,7 @@ func TestAuthInterceptor_ValidTokenReachesHandlerAsPrincipal(t *testing.T) {
 	v := verifier(t, chainSecret)
 	handlers := &seen{}
 	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(v))))
-	validToken := token(t, v, time.Hour, time.Now())
+	validToken := token(t, v, time.Hour)
 	for kind, callWith := range callKinds(t, base) {
 		// When a unary call and a stream are made with it
 		if err := callWith(validToken); err != nil {
@@ -243,11 +244,10 @@ func TestAuthInterceptor_RefusesBadTokens(t *testing.T) {
 	v := verifier(t, chainSecret)
 	handlers := &seen{}
 	base := serve(t, handlers, connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(v))))
-	now := time.Now()
 	badTokens := map[string]string{
 		"none":    "",
-		"expired": token(t, v, time.Minute, now.Add(-time.Hour)),
-		"forged":  token(t, verifier(t, "another-secret-another-secret-0000"), time.Hour, now),
+		"expired": expiredToken(t, v),
+		"forged":  token(t, verifier(t, "another-secret-another-secret-0000"), time.Hour),
 		"garbage": "x.y.z",
 	}
 	for kind, callWith := range callKinds(t, base) {
@@ -347,4 +347,12 @@ func TestOptions_LimitsTheRequestSize(t *testing.T) {
 	if connectgear.DefaultMaxRequestBytes != 8<<20 {
 		t.Fatalf("DefaultMaxRequestBytes = %d", connectgear.DefaultMaxRequestBytes)
 	}
+}
+
+// expiredToken signs a short-lived token on synctest's fake clock, which
+// starts in the year 2000, so by real time it expired long ago.
+func expiredToken(t *testing.T, v authjwt.Signer) (tok string) {
+	t.Helper()
+	synctest.Test(t, func(t *testing.T) { tok = token(t, v, time.Minute) })
+	return tok
 }

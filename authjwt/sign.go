@@ -9,44 +9,33 @@ import (
 	"time"
 )
 
-// ClaimsSet is the JWT Claims Set (RFC 7519 §2) Sign puts in a token.
-// Subject and Roles land in the same claims Verify reads them from, so a
-// signed token round-trips through the Verifier that signed it.
+// ClaimsSet is what Sign puts in a token.
 type ClaimsSet struct {
-	// Subject becomes `sub`. Required.
-	Subject string
-	// Roles become `roles`. Omitted when empty.
-	Roles []string
-	// Issuer becomes `iss` when set.
-	Issuer string
-	// Audience becomes `aud` when set.
-	Audience string
-	// Extra carries app-specific claims (email, a Postgres `role`, a features
-	// map, a session id, ...), at most MaxExtraClaims of them. It may not set
-	// a claim Sign owns: sub, iat, exp, roles, and iss/aud when Issuer/Audience
-	// are set.
-	Extra map[string]any
+	Subject  string         // `sub`, required
+	Roles    []string       // `roles`, omitted when empty
+	Issuer   string         // `iss`, omitted when empty
+	Audience string         // `aud`, omitted when empty
+	Extra    map[string]any // app claims, at most MaxExtraClaims; may not repeat the above, iat or exp
 }
 
-// MaxTTL is the longest lifetime Sign gives a token. It is fixed by design:
-// a bearer token can't be revoked before it expires, so a leaked one must
-// stop working soon. Keep sessions longer than this by signing a fresh token.
-const MaxTTL = time.Hour
+const (
+	// MaxTTL is the longest token lifetime. A bearer token can't be revoked,
+	// so a leaked one must stop working soon; sign a fresh one to stay in.
+	MaxTTL = time.Hour
+	// MaxExtraClaims bounds ClaimsSet.Extra.
+	MaxExtraClaims = 16
+)
 
-// MaxExtraClaims bounds ClaimsSet.Extra. A claim set is a fixed shape the
-// backend decides on, not a bag; a token that needs more is carrying state
-// that belongs in the database.
-const MaxExtraClaims = 16
-
-func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token string, expiresAt time.Time, err error) {
+func (v *verifier) Sign(c ClaimsSet, ttl time.Duration) (token string, expiresAt time.Time, err error) {
 	switch {
 	case ttl <= 0:
 		return "", time.Time{}, errors.New("authjwt: sign: ttl must be positive")
 	case ttl > MaxTTL:
 		return "", time.Time{}, fmt.Errorf("authjwt: sign: ttl %v exceeds MaxTTL %v", ttl, MaxTTL)
 	}
+	now := time.Now()
 	expiresAt = now.Add(ttl)
-	claims, err := v.claimSet(c, now, expiresAt)
+	claims, err := claimSet(c, now, expiresAt)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -70,10 +59,9 @@ func (v *verifier) Sign(c ClaimsSet, ttl time.Duration, now time.Time) (token st
 	return token, expiresAt, nil
 }
 
-// claimSet converts c into the JSON claim set of a token issued at iat and
-// expiring at exp. Extra goes in first and the claims Sign owns last, so an
-// extra can never overwrite them; a reserved key in Extra is still an error.
-func (v *verifier) claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, error) {
+// claimSet merges c into one claim set: Extra first, the claims Sign owns
+// last so an extra can never overwrite them.
+func claimSet(c ClaimsSet, iat, exp time.Time) (map[string]any, error) {
 	if c.Subject == "" {
 		return nil, errors.New("authjwt: sign: empty subject")
 	}

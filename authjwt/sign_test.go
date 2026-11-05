@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/mathis-sperlich/gearbox/authjwt"
@@ -13,7 +14,6 @@ import (
 func TestSign_RoundTripsThroughVerify(t *testing.T) {
 	// Given a verifier and the claims of a signed-in editor with app extras
 	v := newVerifier(t)
-	now := time.Now().Truncate(time.Second)
 	signedInEditor := authjwt.ClaimsSet{
 		Subject:  "user-1",
 		Roles:    []string{"editor"},
@@ -22,23 +22,23 @@ func TestSign_RoundTripsThroughVerify(t *testing.T) {
 		Extra:    map[string]any{"email": "a@b.c", "role": "authenticated"},
 	}
 	// When the claims are signed and verified again
-	token, expiresAt, err := v.Sign(signedInEditor, time.Hour, now)
+	token, expiresAt, err := v.Sign(signedInEditor, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
 	claims, err := v.Verify(token)
-	// Then every claim survives the round trip and the expiry is now+ttl
+	// Then every claim survives the round trip and the expiry is ttl out
 	if err != nil {
 		t.Fatalf("signed token failed Verify: %v", err)
 	}
-	if want := now.Add(time.Hour); !expiresAt.Equal(want) {
-		t.Fatalf("expiresAt = %v, want %v", expiresAt, want)
+	if until := time.Until(expiresAt); until > time.Hour || until < 59*time.Minute {
+		t.Fatalf("expiresAt = %v, want about an hour out", expiresAt)
 	}
 	if claims.Subject != "user-1" || len(claims.Roles) != 1 || claims.Roles[0] != "editor" {
 		t.Fatalf("claims = %+v", claims)
 	}
-	if claims.Raw["iss"] != "gearbox" || claims.Raw["aud"] != "authenticated" || claims.Raw["email"] != "a@b.c" || claims.Raw["role"] != "authenticated" {
-		t.Fatalf("raw claims = %v", claims.Raw)
+	if raw := rawClaims(t, claims); raw["iss"] != "gearbox" || raw["aud"] != "authenticated" || raw["email"] != "a@b.c" || raw["role"] != "authenticated" {
+		t.Fatalf("raw claims = %s", claims.Raw)
 	}
 }
 
@@ -57,7 +57,7 @@ func TestSign_Ed25519RoundTripsThroughPublicKeyVerifier(t *testing.T) {
 		t.Fatalf("NewEd25519Verifier: %v", err)
 	}
 	// When the issuer signs a token and the service verifies it
-	token, _, err := issuer.Sign(authjwt.ClaimsSet{Subject: "user-1"}, time.Hour, time.Now())
+	token, _, err := issuer.Sign(authjwt.ClaimsSet{Subject: "user-1"}, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -68,24 +68,6 @@ func TestSign_Ed25519RoundTripsThroughPublicKeyVerifier(t *testing.T) {
 	}
 	if claims.Subject != "user-1" {
 		t.Fatalf("Subject = %q, want user-1", claims.Subject)
-	}
-}
-
-func TestSign_VerifyOnlyEd25519VerifierCannotSign(t *testing.T) {
-	// Given a verifier that holds only an Ed25519 public key
-	publicKey, _, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	verifyOnly, err := authjwt.NewEd25519Verifier(publicKey)
-	if err != nil {
-		t.Fatalf("NewEd25519Verifier: %v", err)
-	}
-	// When it is asked to sign
-	_, _, err = verifyOnly.Sign(authjwt.ClaimsSet{Subject: "user-1"}, time.Hour, time.Now())
-	// Then it refuses
-	if err == nil {
-		t.Fatal("a verify-only verifier signed a token")
 	}
 }
 
@@ -100,11 +82,11 @@ func TestSign_AlgorithmsDoNotCrossVerify(t *testing.T) {
 		t.Fatalf("NewEd25519Signer: %v", err)
 	}
 	hs256Verifier := newVerifier(t)
-	ed25519Token, _, err := ed25519Verifier.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour, time.Now())
+	ed25519Token, _, err := ed25519Verifier.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign Ed25519: %v", err)
 	}
-	hs256Token, _, err := hs256Verifier.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour, time.Now())
+	hs256Token, _, err := hs256Verifier.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign HS256: %v", err)
 	}
@@ -122,14 +104,14 @@ func TestSign_ExtraIssAllowedWithoutIssuer(t *testing.T) {
 	v := newVerifier(t)
 	legacyIssuer := authjwt.ClaimsSet{Subject: "u", Extra: map[string]any{"iss": "legacy"}}
 	// When they are signed and verified
-	token, _, err := v.Sign(legacyIssuer, time.Hour, time.Now())
+	token, _, err := v.Sign(legacyIssuer, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
 	claims, err := v.Verify(token)
 	// Then the extra iss is kept
-	if err != nil || claims.Raw["iss"] != "legacy" {
-		t.Fatalf("iss = %v err = %v", claims.Raw["iss"], err)
+	if err != nil || rawClaims(t, claims)["iss"] != "legacy" {
+		t.Fatalf("raw = %s err = %v", claims.Raw, err)
 	}
 }
 
@@ -137,7 +119,7 @@ func TestSign_TokenFromOtherSecretRejected(t *testing.T) {
 	// Given a token signed under secret A
 	signer, _ := authjwt.NewVerifier("secret-a-secret-a-secret-a-secret-a")
 	otherVerifier, _ := authjwt.NewVerifier("secret-b-secret-b-secret-b-secret-b")
-	token, _, err := signer.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour, time.Now())
+	token, _, err := signer.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -150,18 +132,21 @@ func TestSign_TokenFromOtherSecretRejected(t *testing.T) {
 }
 
 func TestSign_ExpiredTokenRejected(t *testing.T) {
-	// Given a token signed an hour ago with a one-minute ttl
-	v := newVerifier(t)
-	expiredToken, _, err := v.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Minute, time.Now().Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("Sign: %v", err)
-	}
-	// When it is verified
-	_, err = v.Verify(expiredToken)
-	// Then it is refused
-	if err == nil {
-		t.Fatal("Verify accepted a signed token past its exp")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		// Given a token with a one-minute ttl, on a clock this test controls
+		v := newVerifier(t)
+		shortLivedToken, _, err := v.Sign(authjwt.ClaimsSet{Subject: "u"}, time.Minute)
+		if err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		// When it is verified two minutes later
+		time.Sleep(2 * time.Minute)
+		_, err = v.Verify(shortLivedToken)
+		// Then it is refused
+		if err == nil {
+			t.Fatal("Verify accepted a signed token past its exp")
+		}
+	})
 }
 
 func TestSign_RefusesBadInput(t *testing.T) {
@@ -186,7 +171,7 @@ func TestSign_RefusesBadInput(t *testing.T) {
 	for name, bad := range badInputs {
 		t.Run(name, func(t *testing.T) {
 			// When it is signed
-			token, _, err := v.Sign(bad.claims, bad.ttl, time.Now())
+			token, _, err := v.Sign(bad.claims, bad.ttl)
 			// Then Sign refuses
 			if err == nil {
 				t.Fatalf("Sign accepted bad input, token %s", token)

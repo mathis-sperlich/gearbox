@@ -79,16 +79,16 @@ func BindClaims(inner gearbox.TxRunner, extra ExtraSettings) gearbox.TxRunner {
 // settingsStatement builds the one SELECT set_config(...) statement that binds
 // c's claims and its extra settings, in name order so the SQL text is stable.
 func settingsStatement(ctx context.Context, c *Claims, extra ExtraSettings) (string, []any, error) {
-	raw := c.Raw
-	if raw == nil {
-		raw = map[string]any{"sub": c.Subject}
-	}
-	claimsJSON, err := json.Marshal(raw, json.Deterministic(true))
-	if err != nil {
-		return "", nil, fmt.Errorf("authjwt: marshal claims: %w", err)
+	claimsJSON := c.Raw
+	if claimsJSON == nil {
+		var err error
+		if claimsJSON, err = json.Marshal(map[string]string{"sub": c.Subject}); err != nil {
+			return "", nil, fmt.Errorf("authjwt: marshal claims: %w", err)
+		}
 	}
 	settings := map[string]string{}
 	if extra != nil {
+		var err error
 		if settings, err = extra(ctx, c); err != nil {
 			return "", nil, err
 		}

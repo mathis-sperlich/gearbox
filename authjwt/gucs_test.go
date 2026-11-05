@@ -42,7 +42,7 @@ func TestBindClaims_BindsClaimsAndExtrasBeforeBody(t *testing.T) {
 	roleAndUser := func(_ context.Context, c *authjwt.Claims) (map[string]string, error) {
 		return map[string]string{"role": "authenticated", "app.user": c.Subject}, nil
 	}
-	signedIn := &authjwt.Claims{Subject: "u9", Raw: map[string]any{"sub": "u9", "email": "a@b.c"}}
+	signedIn := &authjwt.Claims{Subject: "u9", Raw: []byte(`{"email":"a@b.c","sub":"u9"}`)}
 	// When a transaction runs for a signed-in caller
 	err := authjwt.BindClaims(runnerOver(tx), roleAndUser).WithTx(context.Background(), signedIn, func(tx pgx.Tx) error {
 		_, err := tx.Exec(context.Background(), "body")
@@ -158,7 +158,7 @@ func TestBindClaims_Postgres(t *testing.T) {
 		return map[string]string{"app.tenant": "it's-t1"}, nil
 	}
 	runner := authjwt.BindClaims(gearbox.PoolTx(pool), quotedTenant)
-	signedIn := &authjwt.Claims{Subject: "u1", Raw: map[string]any{"sub": "u1", "email": "a@b.c"}}
+	signedIn := &authjwt.Claims{Subject: "u1", Raw: []byte(`{"email":"a@b.c","sub":"u1"}`)}
 
 	// When a transaction reads the settings back
 	var sub, tenant string

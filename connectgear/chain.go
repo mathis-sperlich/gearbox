@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strings"
 
 	"connectrpc.com/connect"
 
@@ -23,11 +24,15 @@ import (
 // with the message withheld).
 type Authenticator func(ctx context.Context, spec connect.Spec, header http.Header) (gearbox.Principal, error)
 
-// Bearer is an Authenticator that verifies an "Authorization: Bearer" token
+// Bearer is an Authenticator that verifies the "Authorization: Bearer" token
 // with v and yields its *authjwt.Claims as the Principal.
 func Bearer(v authjwt.Verifier) Authenticator {
 	return func(_ context.Context, _ connect.Spec, h http.Header) (gearbox.Principal, error) {
-		c, err := v.VerifyBearer(h.Get("Authorization"))
+		token, ok := strings.CutPrefix(h.Get("Authorization"), "Bearer ")
+		if !ok {
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("missing bearer token"))
+		}
+		c, err := v.Verify(token)
 		if err != nil {
 			return nil, connect.NewError(connect.CodeUnauthenticated, err)
 		}
@@ -69,8 +74,7 @@ type authInterceptor struct {
 func (i *authInterceptor) authenticate(ctx context.Context, spec connect.Spec, h http.Header) (context.Context, error) {
 	p, err := i.authn(ctx, spec, h)
 	if err != nil {
-		var ce *connect.Error
-		if errors.As(err, &ce) {
+		if ce, ok := errors.AsType[*connect.Error](err); ok {
 			return nil, ce
 		}
 		return nil, Err(err)

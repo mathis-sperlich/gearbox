@@ -59,7 +59,7 @@ func main() {
 
 	svc := &ordersServer{eng: eng}
 	path, handler := ordersv1connect.NewOrdersServiceHandler(svc,
-		connect.WithInterceptors(authInterceptor(verifier), validator))
+		connectgear.Options(connectgear.AuthInterceptor(connectgear.Bearer(verifier)), validator))
 
 	mux := http.NewServeMux()
 	mux.Handle(path, handler)
@@ -121,20 +121,6 @@ func authorize(_ context.Context, p gearbox.Principal, a gearbox.ActionDescripto
 		}
 	}
 	return fmt.Errorf("%w: %q needs role %q", gearbox.ErrUnauthorized, a.Name, a.Role)
-}
-
-// authInterceptor verifies the bearer token and stores the claims as the
-// Principal for handlers to hand to gearbox.
-func authInterceptor(v authjwt.Verifier) connect.UnaryInterceptorFunc {
-	return func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			claims, err := v.VerifyBearer(req.Header().Get("Authorization"))
-			if err != nil {
-				return nil, connectgear.Err(err)
-			}
-			return next(connectgear.WithPrincipal(ctx, claims), req)
-		}
-	}
 }
 
 // seed creates a customer, a product, and a placed order so the example is

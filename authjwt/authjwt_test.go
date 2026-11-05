@@ -45,7 +45,7 @@ func signPayload(t *testing.T, alg, secret string, payload []byte) string {
 	return signingInput + "." + enc.EncodeToString(mac.Sum(nil))
 }
 
-func newVerifier(t *testing.T) authjwt.Verifier {
+func newVerifier(t *testing.T) authjwt.Signer {
 	t.Helper()
 	v, err := authjwt.NewVerifier(testSecret)
 	if err != nil {
@@ -72,28 +72,11 @@ func TestAuthJWT_VerifyReturnsSubjectAndRoles(t *testing.T) {
 	if len(claims.Roles) != 2 || claims.Roles[0] != "editor" || claims.Roles[1] != "viewer" {
 		t.Fatalf("Roles = %v, want [editor viewer]", claims.Roles)
 	}
-	if claims.Raw["sub"] != "user-1" {
-		t.Fatalf("Raw = %v, want sub user-1", claims.Raw)
+	if raw := rawClaims(t, claims); raw["sub"] != "user-1" {
+		t.Fatalf("Raw = %s, want sub user-1", claims.Raw)
 	}
-}
-
-func TestAuthJWT_VerifyBearerValidYieldsClaims(t *testing.T) {
-	// Given an admin token in an Authorization header
-	v := newVerifier(t)
-	adminToken := signToken(t, "HS256", testSecret, map[string]any{
-		"sub": "user-7", "roles": []string{"admin"}, "exp": inAnHour(),
-	})
-	// When the header is verified
-	claims, err := v.VerifyBearer("Bearer " + adminToken)
-	// Then the principal carries the subject and its roles
-	if err != nil {
-		t.Fatalf("VerifyBearer: %v", err)
-	}
-	if claims.Subject != "user-7" {
-		t.Fatalf("Subject = %q, want user-7", claims.Subject)
-	}
-	if roles := authjwt.RolesOf(claims); len(roles) != 1 || roles[0] != "admin" {
-		t.Fatalf("RolesOf = %v, want [admin]", roles)
+	if roles := authjwt.RolesOf(claims); len(roles) != 2 {
+		t.Fatalf("RolesOf = %v, want the same roles", roles)
 	}
 }
 
@@ -140,9 +123,9 @@ func TestAuthJWT_RejectsInvalidTokens(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// When it is verified
 			_, err := v.Verify(invalidToken)
-			// Then it is refused
-			if err == nil {
-				t.Fatal("Verify accepted an invalid token")
+			// Then the caller is unauthenticated
+			if !errors.Is(err, gearbox.ErrUnauthenticated) {
+				t.Fatalf("err = %v, want ErrUnauthenticated", err)
 			}
 		})
 	}
@@ -173,17 +156,6 @@ func tamper(token string) string {
 	return strings.Join(parts, ".")
 }
 
-func TestAuthJWT_VerifyBearerNoHeaderUnauthenticated(t *testing.T) {
-	// Given a request without an Authorization header
-	v := newVerifier(t)
-	// When the empty header is verified
-	_, err := v.VerifyBearer("")
-	// Then the caller is unauthenticated
-	if !errors.Is(err, gearbox.ErrUnauthenticated) {
-		t.Fatalf("err = %v, want ErrUnauthenticated", err)
-	}
-}
-
 func TestAuthJWT_RejectsShortSecret(t *testing.T) {
 	// Given an HS256 secret one byte under MinSecretSize
 	shortSecret := strings.Repeat("x", authjwt.MinSecretSize-1)
@@ -193,4 +165,14 @@ func TestAuthJWT_RejectsShortSecret(t *testing.T) {
 	if err == nil {
 		t.Fatalf("NewVerifier accepted a %d-byte secret", len(shortSecret))
 	}
+}
+
+// rawClaims decodes the signed claim set Verify kept for RLS.
+func rawClaims(t *testing.T, c *authjwt.Claims) map[string]any {
+	t.Helper()
+	var raw map[string]any
+	if err := json.Unmarshal(c.Raw, &raw); err != nil {
+		t.Fatalf("Raw is not a JSON object: %v", err)
+	}
+	return raw
 }
