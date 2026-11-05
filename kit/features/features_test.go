@@ -1,18 +1,12 @@
 package features_test
 
 import (
-	"context"
-	"errors"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/mathis-sperlich/gearbox"
 	"github.com/mathis-sperlich/gearbox/authjwt"
 	"github.com/mathis-sperlich/gearbox/kit/features"
 )
@@ -38,7 +32,7 @@ func (f flag) String() string {
 	return strconv.Itoa(int(f))
 }
 
-func registry(t *testing.T) *features.Registry[flag] {
+func newRegistry(t *testing.T) *features.Registry[flag] {
 	t.Helper()
 	r, err := features.NewRegistry[flag](flagValue)
 	if err != nil {
@@ -52,236 +46,197 @@ const (
 	orgB = "bbbbbbbb-2222-2222-2222-222222222222"
 )
 
-// claim builds a raw claim map the way Verify delivers it (JSON round-trip).
-func claim(buckets map[string]map[string]bool) map[string]any {
-	fs := map[string]any{}
-	for bucket, decisions := range buckets {
-		m := map[string]any{}
-		for name, on := range decisions {
-			m[name] = on
-		}
-		fs[bucket] = m
+const testSecret = "features-test-secret-features-test-0"
+
+func newVerifier(t *testing.T) *authjwt.Verifier {
+	t.Helper()
+	v, err := authjwt.NewVerifier(testSecret)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return map[string]any{features.ClaimName: fs}
+	return v
 }
 
-func TestRegistry(t *testing.T) {
-	r := registry(t)
-	if !r.Known(flagSheets) || r.Known(flagUnspecified) || r.Known(flag(99)) {
-		t.Fatal("Known misclassifies values")
+func TestEmbed_RoundTripsThroughMintAndVerify(t *testing.T) {
+	// Given decisions resolved at sign-in, embedded next to another extra
+	v := newVerifier(t)
+	resolved := features.Decisions{
+		orgA:                  {"FLAG_SHEETS": true},
+		features.GlobalBucket: {"FLAG_REPORTS": true},
 	}
-	if f, ok := r.Lookup("FLAG_REPORTS"); !ok || f != flagReports {
-		t.Fatalf("Lookup = %v, %v", f, ok)
-	}
-	if _, ok := r.Lookup("FLAG_UNSPECIFIED"); ok {
-		t.Fatal("zero value looked up as a feature")
-	}
-	if got := r.Names(); !reflect.DeepEqual(got, []string{"FLAG_REPORTS", "FLAG_SHEETS"}) {
-		t.Fatalf("Names = %v", got)
-	}
-	got := r.Unknown([]string{"FLAG_SHEETS", "FLAG_TYPO", "FLAG_UNSPECIFIED", "FLAG_TYPO"})
-	if !reflect.DeepEqual(got, []string{"FLAG_TYPO", "FLAG_UNSPECIFIED"}) {
-		t.Fatalf("Unknown = %v", got)
-	}
+	signIn := authjwt.MintClaims{Subject: "user-1", Extra: map[string]any{"email": "a@b.c"}}
+	resolved.Embed(&signIn)
 
-	if _, err := features.NewRegistry[flag](map[string]int32{"FLAG_WRONG": 1}); err == nil {
-		t.Fatal("a name String() disagrees with was accepted")
+	// When the token is minted, verified and its decisions read back
+	token, _, err := v.Mint(signIn, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := features.NewRegistry[flag](map[string]int32{"FLAG_UNSPECIFIED": 0}); err == nil {
-		t.Fatal("an enum with only a zero value was accepted")
+	verified, err := v.Verify(token)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
+	got, err := features.FromClaims(verified.Raw)
 
-func TestFromClaims(t *testing.T) {
-	if got := features.FromClaims(nil); len(got) != 0 {
-		t.Fatalf("nil claims: %v", got)
+	// Then they are the decisions that went in, and other extras survive
+	if err != nil || !reflect.DeepEqual(got, resolved) {
+		t.Fatalf("FromClaims = %v, %v; want %v", got, err, resolved)
 	}
-	if got := features.FromClaims(map[string]any{"sub": "x"}); len(got) != 0 {
-		t.Fatalf("absent claim: %v", got)
-	}
-	got := features.FromClaims(map[string]any{features.ClaimName: map[string]any{
-		orgA:      map[string]any{"FLAG_SHEETS": true, "junk": "notabool"},
-		"badtype": "notamap",
-	}})
-	if v, ok := got[orgA]["FLAG_SHEETS"]; !ok || !v {
-		t.Fatalf("valid decision dropped: %v", got)
-	}
-	if _, ok := got[orgA]["junk"]; ok {
-		t.Fatal("non-bool decision kept")
-	}
-	if _, ok := got["badtype"]; ok {
-		t.Fatal("non-map bucket kept")
-	}
-	// An in-process claim map (not JSON round-tripped) parses the same.
-	inproc := features.FromClaims(map[string]any{features.ClaimName: map[string]map[string]bool{orgA: {"FLAG_SHEETS": true}}})
-	if !inproc.Enabled("FLAG_SHEETS", orgA) {
-		t.Fatalf("in-process claim: %v", inproc)
+	if verified.Raw["email"] != "a@b.c" {
+		t.Fatal("Embed clobbered another extra")
 	}
 }
 
-func TestEnabledPrecedence(t *testing.T) {
-	const f = "FLAG_SHEETS"
-	cases := []struct {
-		name    string
-		buckets map[string]map[string]bool
-		want    bool
+func TestEmbed_StartsExtraWhenNil(t *testing.T) {
+	// Given claims with no extras
+	var signIn authjwt.MintClaims
+	// When decisions are embedded
+	features.Decisions{orgA: {"FLAG_SHEETS": true}}.Embed(&signIn)
+	// Then the claim is set
+	if _, ok := signIn.Extra[features.ClaimName]; !ok {
+		t.Fatal("claim not written")
+	}
+}
+
+func TestEnabled_Precedence(t *testing.T) {
+	// Given decisions for orgA, the global bucket, and another org
+	precedenceCases := []struct {
+		name      string
+		decisions features.Decisions
+		want      bool
 	}{
-		{"no decisions → off", nil, false},
-		{"silent on this feature → off", map[string]map[string]bool{orgA: {"FLAG_REPORTS": true}}, false},
-		{"scope grant → on", map[string]map[string]bool{orgA: {f: true}}, true},
-		{"scope denial → off", map[string]map[string]bool{orgA: {f: false}}, false},
-		{"global grant applies when scope silent", map[string]map[string]bool{features.GlobalBucket: {f: true}}, true},
-		{"scope denial beats global grant", map[string]map[string]bool{orgA: {f: false}, features.GlobalBucket: {f: true}}, false},
-		{"scope grant beats global denial", map[string]map[string]bool{orgA: {f: true}, features.GlobalBucket: {f: false}}, true},
-		{"another scope's grant does not leak", map[string]map[string]bool{orgB: {f: true}}, false},
+		{"scope grant is on", features.Decisions{orgA: {"FLAG_SHEETS": true}}, true},
+		{"global grant applies when the scope is silent", features.Decisions{features.GlobalBucket: {"FLAG_SHEETS": true}}, true},
+		{"scope grant beats global denial", features.Decisions{orgA: {"FLAG_SHEETS": true}, features.GlobalBucket: {"FLAG_SHEETS": false}}, true},
+		{"no decisions is off", nil, false},
+		{"silence on this feature is off", features.Decisions{orgA: {"FLAG_REPORTS": true}}, false},
+		{"scope denial is off", features.Decisions{orgA: {"FLAG_SHEETS": false}}, false},
+		{"scope denial beats global grant", features.Decisions{orgA: {"FLAG_SHEETS": false}, features.GlobalBucket: {"FLAG_SHEETS": true}}, false},
+		{"another scope's grant does not leak", features.Decisions{orgB: {"FLAG_SHEETS": true}}, false},
 	}
-	for _, tc := range cases {
+	for _, tc := range precedenceCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := features.FromClaims(claim(tc.buckets)).Enabled(f, orgA); got != tc.want {
-				t.Fatalf("got %v, want %v", got, tc.want)
+			// When FLAG_SHEETS is checked in orgA
+			got := tc.decisions.Enabled(flagSheets, orgA)
+			// Then the most specific decision wins, else off
+			if got != tc.want {
+				t.Fatalf("Enabled = %v, want %v", got, tc.want)
 			}
 		})
 	}
-	global := features.FromClaims(claim(map[string]map[string]bool{features.GlobalBucket: {f: true}}))
-	for _, junk := range []string{"", features.GlobalBucket} {
-		if global.Enabled(f, junk) {
-			t.Fatalf("scope %q reached the global grant", junk)
-		}
-	}
-	if !global.EnabledGlobally(f) || global.EnabledGlobally("FLAG_REPORTS") {
-		t.Fatal("EnabledGlobally misreads the global bucket")
-	}
 }
 
-func TestUUIDScope(t *testing.T) {
-	for name, in := range map[string]string{
-		"canonical":   orgA,
-		"upper case":  "AAAAAAAA-1111-1111-1111-111111111111",
-		"braced":      "{aaaaaaaa-1111-1111-1111-111111111111}",
-		"urn":         "urn:uuid:aaaaaaaa-1111-1111-1111-111111111111",
-		"URN upper":   "URN:UUID:AAAAAAAA-1111-1111-1111-111111111111",
-		"no hyphens":  "aaaaaaaa111111111111111111111111",
-		"mixed+brace": "{AaAaAaAa-1111-1111-1111-111111111111}",
-	} {
-		if got, ok := features.UUIDScope(in); !ok || got != orgA {
-			t.Errorf("%s %q → %q, %v; want %q", name, in, got, ok, orgA)
-		}
-	}
-	for _, junk := range []string{
-		"", "*", "not-a-uuid",
-		"gaaaaaaa-1111-1111-1111-111111111111",          // non-hex
-		"aaaaaaaa1111-1111-1111-1111-111111111111"[:36], // hyphens misplaced
-		"(aaaaaaaa-1111-1111-1111-111111111111)",
-		"urn:uuix:aaaaaaaa-1111-1111-1111-111111111111",
-		"aaaaaaaa-1111-1111-1111-11111111111z",
-	} {
-		if got, ok := features.UUIDScope(junk); ok {
-			t.Errorf("%q accepted as %q", junk, got)
+func TestEnabled_ScopesNamingNoTenantAreOff(t *testing.T) {
+	// Given a global grant
+	globalGrant := features.Decisions{features.GlobalBucket: {"FLAG_SHEETS": true}}
+	scopesNamingNoTenant := []string{"", features.GlobalBucket}
+	for _, scope := range scopesNamingNoTenant {
+		// When the feature is checked in a scope that names no tenant
+		// Then the global grant is not reachable
+		if globalGrant.Enabled(flagSheets, scope) {
+			t.Errorf("scope %q reached the global grant", scope)
 		}
 	}
 }
 
-// Embed puts the resolver's decisions into a minted token; the verified
-// token's claims resolve the same way. Unknown names are dropped.
-func TestEmbed_RoundTripsThroughMintAndVerify(t *testing.T) {
-	r := registry(t)
-	v, err := authjwt.NewVerifier("features-test-secret-features-test-0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var gotPrincipal gearbox.Principal
-	resolve := func(_ context.Context, p gearbox.Principal) (features.Decisions, error) {
-		gotPrincipal = p
-		return features.Decisions{
-			orgA:                  {"FLAG_SHEETS": true, "FLAG_GONE": true},
-			orgB:                  {"FLAG_GONE": true},
-			features.GlobalBucket: {"FLAG_REPORTS": true},
-		}, nil
-	}
-	mc := authjwt.MintClaims{Subject: "user-1", Extra: map[string]any{"email": "a@b.c"}}
-	if err := r.Embed(context.Background(), resolve, "principal", &mc); err != nil {
-		t.Fatal(err)
-	}
-	if gotPrincipal != "principal" {
-		t.Fatalf("resolver saw %v", gotPrincipal)
-	}
-	tok, _, err := v.Mint(mc, time.Hour, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := v.Verify(tok)
-	if err != nil {
-		t.Fatal(err)
-	}
-	d := features.FromClaims(c.Raw)
-	want := features.Decisions{orgA: {"FLAG_SHEETS": true}, features.GlobalBucket: {"FLAG_REPORTS": true}}
-	if !reflect.DeepEqual(d, want) {
-		t.Fatalf("decisions = %v, want %v", d, want)
-	}
-	if c.Raw["email"] != "a@b.c" {
-		t.Fatal("Embed clobbered other extras")
-	}
-	if !d.Enabled("FLAG_SHEETS", orgA) || !d.Enabled("FLAG_REPORTS", orgB) || d.Enabled("FLAG_SHEETS", orgB) {
-		t.Fatalf("resolution after round trip wrong: %v", d)
+func TestFromClaims_AbsentClaimHasNoDecisions(t *testing.T) {
+	// Given verified claims without a features claim
+	withoutFeatures := map[string]any{"sub": "user-1"}
+	// When they are converted
+	got, err := features.FromClaims(withoutFeatures)
+	// Then there are no decisions and no error
+	if err != nil || len(got) != 0 {
+		t.Fatalf("FromClaims = %v, %v", got, err)
 	}
 }
 
-func TestEmbed_Errors(t *testing.T) {
-	r := registry(t)
-	var mc authjwt.MintClaims
-	if err := r.Embed(context.Background(), nil, nil, &mc); err == nil {
-		t.Fatal("nil resolver accepted")
+func TestFromClaims_RejectsShapesWeNeverMint(t *testing.T) {
+	// Given features claims of shapes the app never mints
+	malformedClaims := map[string]any{
+		"not an object":       "FLAG_SHEETS",
+		"bucket not a map":    map[string]any{orgA: "FLAG_SHEETS"},
+		"decision not a bool": map[string]any{orgA: map[string]any{"FLAG_SHEETS": "yes"}},
 	}
-	boom := errors.New("boom")
-	err := r.Embed(context.Background(), func(context.Context, gearbox.Principal) (features.Decisions, error) {
-		return nil, boom
-	}, nil, &mc)
-	if !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want wrapped boom", err)
-	}
-	if _, set := mc.Extra[features.ClaimName]; set {
-		t.Fatal("claim written despite resolver error")
+	for name, claim := range malformedClaims {
+		// When they are converted
+		_, err := features.FromClaims(map[string]any{features.ClaimName: claim})
+		// Then it is an error
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }
 
-func TestAssertKnown_DB(t *testing.T) {
-	url := os.Getenv("GEARBOX_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("GEARBOX_TEST_DATABASE_URL not set")
+func TestNewRegistry_KnowsEveryNonZeroValue(t *testing.T) {
+	// Given the registry of the flag enum
+	r := newRegistry(t)
+	// When its values are asked about
+	// Then the non-zero ones are features, zero and undefined ones are not
+	if !r.Known(flagReports) || !r.Known(flagSheets) {
+		t.Fatal("defined feature unknown")
 	}
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, url)
+	if r.Known(flagUnspecified) || r.Known(flag(99)) {
+		t.Fatal("zero or undefined value known")
+	}
+}
+
+func TestNewRegistry_OnlyZeroIsValid(t *testing.T) {
+	// Given an enum with no features yet
+	onlyUnspecified := map[string]int32{"FLAG_UNSPECIFIED": 0}
+	// When a registry is built
+	r, err := features.NewRegistry[flag](onlyUnspecified)
+	// Then it is valid and knows nothing
+	if err != nil || r.Known(flagSheets) {
+		t.Fatalf("NewRegistry = %v", err)
+	}
+}
+
+func TestNewRegistry_RefusesNamesStringDisagreesWith(t *testing.T) {
+	// Given a name map that disagrees with the enum's String
+	misnamed := map[string]int32{"FLAG_UNSPECIFIED": 0, "FLAG_WRONG": 1}
+	// When a registry is built
+	_, err := features.NewRegistry[flag](misnamed)
+	// Then it fails hard
+	if err == nil {
+		t.Fatal("accepted")
+	}
+}
+
+// zeroReports names zero FLAG_REPORTS, so String agrees with the map but the
+// zero value is a real feature.
+type zeroReports int32
+
+func (zeroReports) String() string { return "FLAG_REPORTS" }
+
+func TestNewRegistry_RefusesAFeatureAtZero(t *testing.T) {
+	// Given an enum whose zero value is a real feature
+	featureAtZero := map[string]int32{"FLAG_REPORTS": 0}
+	// When a registry is built
+	_, err := features.NewRegistry[zeroReports](featureAtZero)
+	// Then it fails hard, naming the rule
+	if err == nil || !strings.Contains(err.Error(), "_UNSPECIFIED") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAssertKnown_AcceptsDefinedNames(t *testing.T) {
+	// Given stored names the enum defines, with duplicates
+	stored := []string{"FLAG_SHEETS", "FLAG_REPORTS", "FLAG_SHEETS"}
+	// When they are checked
+	err := newRegistry(t).AssertKnown(stored)
+	// Then boot proceeds
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
-	// A temp table inside a rolled-back tx: nothing outlives the test.
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `create temp table feature_access (feature text not null) on commit drop`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `insert into feature_access values ('FLAG_SHEETS'), ('FLAG_REPORTS'), ('FLAG_SHEETS')`); err != nil {
-		t.Fatal(err)
-	}
-	r := registry(t)
-	if err := r.AssertKnown(ctx, tx, ""); err != nil {
-		t.Fatalf("known names refused: %v", err)
-	}
-	if _, err := tx.Exec(ctx, `insert into feature_access values ('FLAG_TYPO'), ('FLAG_UNSPECIFIED')`); err != nil {
-		t.Fatal(err)
-	}
-	err = r.AssertKnown(ctx, tx, "")
-	if err == nil || !strings.Contains(err.Error(), "FLAG_TYPO") || !strings.Contains(err.Error(), "FLAG_UNSPECIFIED") {
-		t.Fatalf("err = %v, want both unknown names", err)
-	}
-	if err := r.AssertKnown(ctx, tx, `select 'FLAG_SHEETS'::text`); err != nil {
-		t.Fatalf("custom query: %v", err)
-	}
-	if err := r.AssertKnown(ctx, tx, `select nope from nowhere`); err == nil {
-		t.Fatal("query error swallowed")
+}
+
+func TestAssertKnown_NamesEveryUnknownOnce(t *testing.T) {
+	// Given stored names with a typo (twice) and the zero value's name
+	stored := []string{"FLAG_SHEETS", "FLAG_TYPO", "FLAG_UNSPECIFIED", "FLAG_TYPO"}
+	// When they are checked
+	err := newRegistry(t).AssertKnown(stored)
+	// Then the error lists each unknown name once, sorted
+	if err == nil || !strings.HasSuffix(err.Error(), "[FLAG_TYPO FLAG_UNSPECIFIED]") {
+		t.Fatalf("err = %v", err)
 	}
 }

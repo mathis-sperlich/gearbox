@@ -1,220 +1,130 @@
 // Package features gates an app's features per tenant scope, keyed by the
-// app's own feature enum (a generated proto enum, or any ~int32 type with a
-// String method and a name→value map).
+// app's own proto feature enum.
 //
-// Decisions are resolved once, when a token is minted: Embed asks the app's
-// Resolver for the principal's explicit decisions and writes them into the
-// token as the "features" claim. Checks afterwards are map lookups on the
-// verified claims — no DB reads, no cache; staleness is bounded by the token
-// TTL.
-//
-// Claim shape:
+// The app resolves a user's decisions once, when it mints their token, and
+// Decisions.Embed writes them into the token as the "features" claim:
 //
 //	"features": { "<scope>": { "FEATURE_X": true, ... }, "*": { ... } }
 //
-// A scope is whatever the app tenants by (an organisation id, a workspace
-// slug); "*" holds decisions that apply everywhere. Only explicit decisions
-// appear; anything absent resolves OFF — dark by default.
+// A scope is whatever the app tenants by (an organisation id), spelled
+// exactly as requests name it — the app mints the keys, so lookups are plain
+// map reads. "*" holds decisions for every scope; a global grant is how a
+// feature goes GA. Only explicit decisions appear; anything absent is off.
 //
-// Gate turns a procedure→feature map into a Connect interceptor that fails
-// closed, Has answers "is f on here?" inside a handler, and AssertKnown
-// red-lights boot when the decisions table names a feature the compiled enum
-// doesn't know.
+// Checks never touch the database: the Gate and Decisions.Enabled read the
+// claims connectgear's AuthInterceptor already verified and holds in memory.
+// A decision is therefore as fresh as the token (bounded by its TTL).
 package features
 
 import (
+	"encoding/json"
 	"fmt"
-	"maps"
-	"sort"
+	"slices"
 	"strings"
+
+	"github.com/mathis-sperlich/gearbox/authjwt"
 )
 
 // ClaimName is the JWT claim the decisions travel in.
 const ClaimName = "features"
 
-// GlobalBucket is the claim bucket for decisions that aren't scoped to one
-// tenant. A global grant is how a feature goes GA.
+// GlobalBucket is the claim bucket for decisions that apply in every scope.
 const GlobalBucket = "*"
 
-// Feature is the constraint on an app's feature enum: a generated proto enum
-// satisfies it as is.
+// Feature is an app's feature enum; a generated proto enum satisfies it. A
+// feature's name (String) is its identity everywhere outside the binary: the
+// claim and the app's decisions table store the name, never the number.
 type Feature interface {
 	~int32
 	String() string
 }
 
-// Registry is the set of known values of a feature enum, by name. The zero
-// value (proto's *_UNSPECIFIED) is never a feature.
+// Registry is the set of features an enum defines.
 type Registry[F Feature] struct {
-	byName map[string]F
+	names map[string]bool
 }
 
-// NewRegistry builds a Registry from the enum's name→value map (the generated
-// Foo_value). Values must be distinct and named as their String method names
-// them; zero is skipped.
+// NewRegistry builds a Registry from the enum's generated name→value map
+// (Foo_value). An enum whose only value is zero is valid: the app gates
+// nothing yet.
 func NewRegistry[F Feature](values map[string]int32) (*Registry[F], error) {
-	r := &Registry[F]{byName: make(map[string]F, len(values))}
+	r := &Registry[F]{names: make(map[string]bool, len(values))}
 	for name, v := range values {
+		if got := F(v).String(); got != name {
+			return nil, fmt.Errorf("features: enum value %d is named %q, but String() says %q", v, name, got)
+		}
 		if v == 0 {
+			// Zero is what an enum field holds when nobody set it, so it
+			// must never name a feature: proto style reserves it for
+			// *_UNSPECIFIED. Any other name means a real feature got zero.
+			if !strings.HasSuffix(name, "_UNSPECIFIED") {
+				return nil, fmt.Errorf("features: enum zero value is %q, want *_UNSPECIFIED", name)
+			}
 			continue
 		}
-		f := F(v)
-		if f.String() != name {
-			return nil, fmt.Errorf("features: enum value %d is named %q, but String() says %q", v, name, f.String())
-		}
-		r.byName[name] = f
-	}
-	if len(r.byName) == 0 {
-		return nil, fmt.Errorf("features: enum has no values besides zero")
+		r.names[name] = true
 	}
 	return r, nil
 }
 
-// Lookup returns the feature named name. ok is false for unknown names and
-// for the zero value.
-func (r *Registry[F]) Lookup(name string) (f F, ok bool) {
-	f, ok = r.byName[name]
-	return f, ok
-}
+// Known reports whether f is a feature of the enum (zero is not).
+func (r *Registry[F]) Known(f F) bool { return r.names[f.String()] }
 
-// Known reports whether f is a non-zero value of the enum.
-func (r *Registry[F]) Known(f F) bool {
-	g, ok := r.byName[f.String()]
-	return ok && g == f
-}
-
-// Names returns every known feature name, sorted.
-func (r *Registry[F]) Names() []string {
-	out := make([]string, 0, len(r.byName))
-	for name := range r.byName {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// Unknown returns the names in names the registry doesn't know, sorted and
-// deduplicated. The zero value's name counts as unknown.
-func (r *Registry[F]) Unknown(names []string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, n := range names {
-		if _, ok := r.byName[n]; !ok && !seen[n] {
-			seen[n] = true
-			out = append(out, n)
+// AssertKnown fails when stored names a feature the enum doesn't define — a
+// typo'd row, or one left behind by a deleted enum value — so it red-lights
+// boot instead of surfacing later as a silently dark feature. stored is
+// typically `select distinct feature from feature_access`.
+func (r *Registry[F]) AssertKnown(stored []string) error {
+	var unknown []string
+	for _, name := range stored {
+		if !r.names[name] {
+			unknown = append(unknown, name)
 		}
 	}
-	sort.Strings(out)
-	return out
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		return fmt.Errorf("features: stored feature names the enum doesn't define: %v", slices.Compact(unknown))
+	}
+	return nil
 }
 
-// Decisions is the parsed claim: bucket (canonical scope or GlobalBucket) →
-// feature name → explicit enabled/disabled decision.
+// Decisions is the "features" claim: scope (or GlobalBucket) → feature name →
+// explicit decision.
 type Decisions map[string]map[string]bool
 
-// FromClaims parses the ClaimName claim out of a verified claim map
-// (authjwt.Claims.Raw). Absent or malformed claims, buckets and entries are
-// dropped, so they resolve off.
-func FromClaims(raw map[string]any) Decisions {
-	out := Decisions{}
-	switch claim := raw[ClaimName].(type) {
-	case map[string]any:
-		for bucket, v := range claim {
-			switch m := v.(type) {
-			case map[string]any:
-				decisions := make(map[string]bool, len(m))
-				for name, ev := range m {
-					if b, ok := ev.(bool); ok {
-						decisions[name] = b
-					}
-				}
-				out[bucket] = decisions
-			case map[string]bool:
-				out[bucket] = cloneBucket(m)
-			}
-		}
-	case map[string]map[string]bool:
-		// Not round-tripped through JSON (a claim map built in process).
-		for bucket, m := range claim {
-			out[bucket] = cloneBucket(m)
-		}
-	case Decisions:
-		for bucket, m := range claim {
-			out[bucket] = cloneBucket(m)
-		}
+// Embed writes d into mc as the ClaimName claim, replacing any earlier one.
+func (d Decisions) Embed(mc *authjwt.MintClaims) {
+	if mc.Extra == nil {
+		mc.Extra = map[string]any{}
 	}
-	return out
+	mc.Extra[ClaimName] = d
 }
 
-func cloneBucket(m map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(m))
-	maps.Copy(out, m)
-	return out
+// FromClaims converts the ClaimName claim of verified claims
+// (authjwt.Claims.Raw) to Decisions. A token without the claim has none. The
+// app minted the claim, so any other shape is an error, not something to
+// work around.
+func FromClaims(raw map[string]any) (Decisions, error) {
+	b, err := json.Marshal(raw[ClaimName])
+	if err != nil {
+		return nil, fmt.Errorf("features: %w", err)
+	}
+	var d Decisions
+	if err := json.Unmarshal(b, &d); err != nil {
+		return nil, fmt.Errorf("features: malformed %q claim: %w", ClaimName, err)
+	}
+	return d, nil
 }
 
-// Enabled answers "is the feature named name on in scope?": the scope's
-// decision first, then the global bucket, then off. scope must already be
-// canonical (see Gate's Canonical); an empty scope or GlobalBucket names no
-// tenant and resolves off — falling through would hand junk input every
-// global grant.
-func (d Decisions) Enabled(name, scope string) bool {
+// Enabled reports whether f is on in scope: the scope's decision, else the
+// global one, else off. An empty scope or GlobalBucket names no tenant and is
+// off, so a request can't pick up global grants by naming "*".
+func (d Decisions) Enabled(f fmt.Stringer, scope string) bool {
 	if scope == "" || scope == GlobalBucket {
 		return false
 	}
-	if v, ok := d[scope][name]; ok {
-		return v
+	if on, ok := d[scope][f.String()]; ok {
+		return on
 	}
-	return d.EnabledGlobally(name)
-}
-
-// EnabledGlobally answers from the global bucket alone, for an app that
-// doesn't tenant.
-func (d Decisions) EnabledGlobally(name string) bool {
-	return d[GlobalBucket][name]
-}
-
-// UUIDScope canonicalises a UUID scope to its lower-case hyphenated form,
-// accepting the spellings Postgres and most UUID parsers accept (upper case,
-// braces, urn:uuid: prefix, no hyphens). Claim buckets are keyed by the
-// canonical form, so without this "ABC…" would miss its tenant's bucket and
-// fall through to the global one, lifting a tenant-level denial. Anything
-// that isn't a UUID is refused.
-func UUIDScope(s string) (string, bool) {
-	switch len(s) {
-	case 36:
-	case 38:
-		if s[0] != '{' || s[37] != '}' {
-			return "", false
-		}
-		s = s[1:37]
-	case 45:
-		if !strings.EqualFold(s[:9], "urn:uuid:") {
-			return "", false
-		}
-		s = s[9:]
-	case 32:
-		if !isHex(s) {
-			return "", false
-		}
-		s = s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:]
-	default:
-		return "", false
-	}
-	if s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return "", false
-	}
-	if !isHex(s[:8] + s[9:13] + s[14:18] + s[19:23] + s[24:]) {
-		return "", false
-	}
-	return strings.ToLower(s), true
-}
-
-func isHex(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
-			return false
-		}
-	}
-	return true
+	return d[GlobalBucket][f.String()]
 }

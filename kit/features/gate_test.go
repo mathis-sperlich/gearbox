@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,81 +18,45 @@ import (
 )
 
 const (
-	gateSecret  = "features-gate-test-secret-0000000000"
-	procSend    = "/test.v1.Sheets/Send"   // gated on FLAG_SHEETS
-	procOpen    = "/test.v1.Sheets/Open"   // ungated
-	procWatch   = "/test.v1.Sheets/Watch"  // gated server stream
-	procPublic  = "/test.v1.Sheets/Public" // ungated, no credentials needed
-	procOpenStr = "/test.v1.Sheets/Tail"   // ungated server stream
+	procSend   = "/test.v1.Sheets/Send"   // gated unary
+	procOpen   = "/test.v1.Sheets/Open"   // ungated unary
+	procWatch  = "/test.v1.Sheets/Watch"  // gated server stream
+	procTail   = "/test.v1.Sheets/Tail"   // ungated server stream
+	procPublic = "/test.v1.Sheets/Public" // ungated, no credentials needed
 )
 
-type str = wrapperspb.StringValue
+// The test service's messages are StringValues whose value is the scope.
+type scopeMsg = wrapperspb.StringValue
 
-// scopeOf reads the scope off the request: the StringValue is the scope.
-func scopeOf(_ context.Context, _ string, msg any) (string, bool) {
-	m, ok := msg.(*str)
-	if !ok || m.GetValue() == "" {
-		return "", false
-	}
-	return m.GetValue(), true
-}
+func scopeOf(msg any) string { return msg.(*scopeMsg).GetValue() }
 
-func gate(t *testing.T, cfg features.GateConfig[flag]) *features.Gate[flag] {
+func newGate(t *testing.T) *features.Gate[flag] {
 	t.Helper()
-	if cfg.Registry == nil {
-		cfg.Registry = registry(t)
-	}
-	if cfg.Methods == nil {
-		cfg.Methods = map[string]flag{procSend: flagSheets, procWatch: flagSheets}
-	}
-	g, err := features.NewGate(cfg)
+	g, err := features.NewGate(newRegistry(t), map[string]flag{procSend: flagSheets, procWatch: flagSheets}, scopeOf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return g
 }
 
-func tenanted(t *testing.T) *features.Gate[flag] {
-	return gate(t, features.GateConfig[flag]{ScopeOf: scopeOf, Canonical: features.UUIDScope})
-}
-
-// hasLog records what Has said in each handler call.
-type hasLog struct {
-	mu  sync.Mutex
-	has []bool
-}
-
-func (h *hasLog) add(v bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.has = append(h.has, v)
-}
-
-func (h *hasLog) get() []bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]bool(nil), h.has...)
-}
-
-func serve(t *testing.T, authn connectgear.Authenticator, g *features.Gate[flag], log *hasLog) string {
+// serve runs the test service behind authn and g.
+func serve(t *testing.T, authn connectgear.Authenticator, g *features.Gate[flag]) string {
 	t.Helper()
 	opts := connectgear.Options(
 		connectgear.AuthInterceptor(authn, connectgear.PublicProcedures(procPublic)),
 		g.Interceptor(),
 	)
-	unary := func(ctx context.Context, r *connect.Request[str]) (*connect.Response[str], error) {
-		log.add(features.Has(ctx, flagSheets))
-		return connect.NewResponse(wrapperspb.String("ok")), nil
+	unary := func(context.Context, *connect.Request[scopeMsg]) (*connect.Response[scopeMsg], error) {
+		return connect.NewResponse(&scopeMsg{}), nil
 	}
-	stream := func(ctx context.Context, r *connect.Request[str], out *connect.ServerStream[str]) error {
-		log.add(features.Has(g.WithScope(ctx, r.Msg.GetValue()), flagSheets))
-		return out.Send(wrapperspb.String("ok"))
+	stream := func(_ context.Context, _ *connect.Request[scopeMsg], out *connect.ServerStream[scopeMsg]) error {
+		return out.Send(&scopeMsg{})
 	}
 	mux := http.NewServeMux()
 	for _, p := range []string{procSend, procOpen, procPublic} {
 		mux.Handle(p, connect.NewUnaryHandler(p, unary, opts))
 	}
-	for _, p := range []string{procWatch, procOpenStr} {
+	for _, p := range []string{procWatch, procTail} {
 		mux.Handle(p, connect.NewServerStreamHandler(p, stream, opts))
 	}
 	srv := httptest.NewServer(mux)
@@ -101,30 +64,30 @@ func serve(t *testing.T, authn connectgear.Authenticator, g *features.Gate[flag]
 	return srv.URL
 }
 
-func mint(t *testing.T, v *authjwt.Verifier, buckets map[string]map[string]bool) string {
+func tokenWith(t *testing.T, v *authjwt.Verifier, d features.Decisions) string {
 	t.Helper()
-	tok, _, err := v.Mint(authjwt.MintClaims{Subject: "user-1", Extra: claim(buckets)}, time.Hour, time.Now())
+	signIn := authjwt.MintClaims{Subject: "user-1"}
+	d.Embed(&signIn)
+	token, _, err := v.Mint(signIn, time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tok
+	return token
 }
 
-func call(base, proc, bearer, scope string) error {
+func call(base, proc, token, scope string) error {
 	req := connect.NewRequest(wrapperspb.String(scope))
-	if bearer != "" {
-		req.Header().Set("Authorization", "Bearer "+bearer)
+	if token != "" {
+		req.Header().Set("Authorization", "Bearer "+token)
 	}
-	_, err := connect.NewClient[str, str](http.DefaultClient, base+proc).CallUnary(context.Background(), req)
+	_, err := connect.NewClient[scopeMsg, scopeMsg](http.DefaultClient, base+proc).CallUnary(context.Background(), req)
 	return err
 }
 
-func callStream(base, proc, bearer, scope string) error {
+func callStream(base, proc, token, scope string) error {
 	req := connect.NewRequest(wrapperspb.String(scope))
-	if bearer != "" {
-		req.Header().Set("Authorization", "Bearer "+bearer)
-	}
-	st, err := connect.NewClient[str, str](http.DefaultClient, base+proc).CallServerStream(context.Background(), req)
+	req.Header().Set("Authorization", "Bearer "+token)
+	st, err := connect.NewClient[scopeMsg, scopeMsg](http.DefaultClient, base+proc).CallServerStream(context.Background(), req)
 	if err != nil {
 		return err
 	}
@@ -134,179 +97,128 @@ func callStream(base, proc, bearer, scope string) error {
 	return st.Err()
 }
 
-func denied(t *testing.T, what string, err error) {
+func wantDenied(t *testing.T, what string, err error) {
 	t.Helper()
 	if connect.CodeOf(err) != connect.CodePermissionDenied {
 		t.Errorf("%s: err = %v, want permission_denied", what, err)
 	}
 }
 
-func TestNewGate_RefusesUnknownFeatures(t *testing.T) {
-	for _, f := range []flag{flagUnspecified, flag(99)} {
-		_, err := features.NewGate(features.GateConfig[flag]{
-			Registry: registry(t),
-			Methods:  map[string]flag{procSend: f},
-		})
-		if err == nil {
-			t.Errorf("gate on %v accepted", f)
-		}
+func TestGate_AllowsAFeatureOnInTheRequestScope(t *testing.T) {
+	// Given a caller with FLAG_SHEETS granted in orgA, and one granted globally
+	v := newVerifier(t)
+	base := serve(t, connectgear.Bearer(v), newGate(t))
+	grantedInOrgA := tokenWith(t, v, features.Decisions{orgA: {"FLAG_SHEETS": true}})
+	grantedGlobally := tokenWith(t, v, features.Decisions{features.GlobalBucket: {"FLAG_SHEETS": true}})
+
+	// When they call the gated procedures in a scope where it is on
+	// Then the calls succeed
+	if err := call(base, procSend, grantedInOrgA, orgA); err != nil {
+		t.Fatalf("scope grant: %v", err)
 	}
-	if _, err := features.NewGate(features.GateConfig[flag]{}); err == nil {
-		t.Error("gate without a registry accepted")
+	if err := call(base, procSend, grantedGlobally, orgB); err != nil {
+		t.Fatalf("global grant: %v", err)
+	}
+	if err := callStream(base, procWatch, grantedInOrgA, orgA); err != nil {
+		t.Fatalf("stream, scope grant: %v", err)
 	}
 }
 
-func TestGate_UnaryFailsClosed(t *testing.T) {
-	v := mustVerifier(t)
-	g := tenanted(t)
-	log := &hasLog{}
-	base := serve(t, connectgear.Bearer(v), g, log)
+func TestGate_PassesUngatedProcedures(t *testing.T) {
+	// Given a caller with no decisions and an unauthenticated caller
+	v := newVerifier(t)
+	base := serve(t, connectgear.Bearer(v), newGate(t))
+	noDecisions := tokenWith(t, v, nil)
 
-	none := mint(t, v, nil)
-	orgOn := mint(t, v, map[string]map[string]bool{orgA: {"FLAG_SHEETS": true}})
-	orgOffGlobalOn := mint(t, v, map[string]map[string]bool{orgA: {"FLAG_SHEETS": false}, features.GlobalBucket: {"FLAG_SHEETS": true}})
-	globalOn := mint(t, v, map[string]map[string]bool{features.GlobalBucket: {"FLAG_SHEETS": true}})
-	globalKill := mint(t, v, map[string]map[string]bool{features.GlobalBucket: {"FLAG_SHEETS": false}})
-	elsewhere := mint(t, v, map[string]map[string]bool{orgB: {"FLAG_SHEETS": true}})
-
-	if err := call(base, procOpen, none, ""); err != nil {
-		t.Fatalf("ungated, no decisions, no scope: %v", err)
+	// When they call procedures the gate doesn't list
+	// Then the gate lets them through
+	if err := call(base, procOpen, noDecisions, ""); err != nil {
+		t.Fatalf("ungated: %v", err)
 	}
 	if err := call(base, procPublic, "", ""); err != nil {
 		t.Fatalf("ungated public, unauthenticated: %v", err)
 	}
-	denied(t, "gated, no decisions", call(base, procSend, none, orgA))
-	denied(t, "gated, no scope", call(base, procSend, orgOn, ""))
-	denied(t, "gated, junk scope", call(base, procSend, globalOn, "not-a-uuid"))
-	denied(t, "gated, scope '*' with a global grant", call(base, procSend, globalOn, features.GlobalBucket))
-	denied(t, "gated, global kill", call(base, procSend, globalKill, orgA))
-	denied(t, "gated, another scope's grant", call(base, procSend, elsewhere, orgA))
-	for _, spelling := range []string{"AAAAAAAA-1111-1111-1111-111111111111", "{" + orgA + "}", "urn:uuid:" + orgA} {
-		denied(t, "gated, scope denial + global grant, spelled "+spelling, call(base, procSend, orgOffGlobalOn, spelling))
-	}
-
-	if err := call(base, procSend, orgOn, orgA); err != nil {
-		t.Fatalf("gated, scope grant: %v", err)
-	}
-	if err := call(base, procSend, orgOn, "AAAAAAAA-1111-1111-1111-111111111111"); err != nil {
-		t.Fatalf("gated, scope grant, upper-case scope: %v", err)
-	}
-	if err := call(base, procSend, globalOn, orgB); err != nil {
-		t.Fatalf("gated, global grant: %v", err)
-	}
-	// Has inside ungated handlers reflects the caller's scope too.
-	if err := call(base, procOpen, orgOn, orgB); err != nil {
-		t.Fatal(err)
-	}
-	if err := call(base, procOpen, orgOn, orgA); err != nil {
-		t.Fatal(err)
-	}
-	if err := call(base, procPublic, "", orgA); err != nil {
-		t.Fatal(err)
-	}
-	want := []bool{false, false, true, true, true, false, true, false}
-	if got := log.get(); len(got) != len(want) || !equal(got, want) {
-		t.Fatalf("Has per handler call = %v, want %v", got, want)
-	}
-}
-
-func equal(a, b []bool) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return len(a) == len(b)
-}
-
-// A principal that isn't *authjwt.Claims carries no decisions: gated calls
-// are refused, ungated ones pass.
-func TestGate_ForeignPrincipalHasNoDecisions(t *testing.T) {
-	authn := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
-		return "api-key-42", nil
-	}
-	log := &hasLog{}
-	base := serve(t, authn, tenanted(t), log)
-	denied(t, "gated, foreign principal", call(base, procSend, "", orgA))
-	denied(t, "gated stream, foreign principal", callStream(base, procWatch, "", orgA))
-	if err := call(base, procOpen, "", orgA); err != nil {
-		t.Fatal(err)
-	}
-	if got := log.get(); !equal(got, []bool{false}) {
-		t.Fatalf("Has = %v", got)
-	}
-}
-
-func TestGate_ServerStreamGatedOnItsRequest(t *testing.T) {
-	v := mustVerifier(t)
-	log := &hasLog{}
-	base := serve(t, connectgear.Bearer(v), tenanted(t), log)
-	orgOn := mint(t, v, map[string]map[string]bool{orgA: {"FLAG_SHEETS": true}})
-
-	denied(t, "stream, no decisions", callStream(base, procWatch, mint(t, v, nil), orgA))
-	denied(t, "stream, other scope", callStream(base, procWatch, orgOn, orgB))
-	denied(t, "stream, no scope", callStream(base, procWatch, orgOn, ""))
-	if err := callStream(base, procWatch, orgOn, orgA); err != nil {
-		t.Fatalf("stream, scope grant: %v", err)
-	}
-	if err := callStream(base, procOpenStr, orgOn, orgB); err != nil {
+	if err := callStream(base, procTail, noDecisions, ""); err != nil {
 		t.Fatalf("ungated stream: %v", err)
 	}
-	if got := log.get(); !equal(got, []bool{true, false}) {
-		t.Fatalf("Has in stream handlers = %v, want [true false]", got)
+}
+
+func TestGate_FailsClosed(t *testing.T) {
+	// Given callers whose tokens don't turn FLAG_SHEETS on in the request scope
+	v := newVerifier(t)
+	base := serve(t, connectgear.Bearer(v), newGate(t))
+	grantedInOrgA := tokenWith(t, v, features.Decisions{orgA: {"FLAG_SHEETS": true}})
+	grantedGlobally := tokenWith(t, v, features.Decisions{features.GlobalBucket: {"FLAG_SHEETS": true}})
+	refusedCalls := []struct {
+		name, token, scope string
+	}{
+		{"no decisions", tokenWith(t, v, nil), orgA},
+		{"no scope", grantedInOrgA, ""},
+		{"scope '*' with a global grant", grantedGlobally, features.GlobalBucket},
+		{"global kill switch", tokenWith(t, v, features.Decisions{features.GlobalBucket: {"FLAG_SHEETS": false}}), orgA},
+		{"another scope's grant", grantedInOrgA, orgB},
+		{"scope denial over a global grant", tokenWith(t, v, features.Decisions{orgA: {"FLAG_SHEETS": false}, features.GlobalBucket: {"FLAG_SHEETS": true}}), orgA},
+	}
+	for _, rc := range refusedCalls {
+		// When they call the gated unary and stream
+		// Then both are refused
+		wantDenied(t, rc.name, call(base, procSend, rc.token, rc.scope))
+		wantDenied(t, rc.name+" (stream)", callStream(base, procWatch, rc.token, rc.scope))
 	}
 }
 
-// Without ScopeOf the app doesn't tenant: the global bucket decides.
-func TestGate_Untenanted(t *testing.T) {
-	v := mustVerifier(t)
-	log := &hasLog{}
-	base := serve(t, connectgear.Bearer(v), gate(t, features.GateConfig[flag]{}), log)
-	denied(t, "no decision", call(base, procSend, mint(t, v, nil), ""))
-	denied(t, "scope grant only", call(base, procSend, mint(t, v, map[string]map[string]bool{orgA: {"FLAG_SHEETS": true}}), orgA))
-	if err := call(base, procSend, mint(t, v, map[string]map[string]bool{features.GlobalBucket: {"FLAG_SHEETS": true}}), ""); err != nil {
-		t.Fatalf("global grant: %v", err)
+func TestGate_RefusesPrincipalsWithoutClaims(t *testing.T) {
+	// Given an authenticator whose principal isn't *authjwt.Claims
+	apiKeyAuth := func(context.Context, connect.Spec, http.Header) (gearbox.Principal, error) {
+		return "api-key-42", nil
 	}
-	if got := log.get(); !equal(got, []bool{true}) {
-		t.Fatalf("Has = %v", got)
+	base := serve(t, apiKeyAuth, newGate(t))
+	// When it calls a gated procedure
+	err := call(base, procSend, "", orgA)
+	// Then it has no decisions and is refused
+	wantDenied(t, "foreign principal", err)
+}
+
+func TestGate_RefusesMalformedClaim(t *testing.T) {
+	// Given a principal whose features claim isn't the shape the app mints
+	g := newGate(t)
+	malformed := &authjwt.Claims{Subject: "user-1", Raw: map[string]any{features.ClaimName: "FLAG_SHEETS"}}
+	ctx := connectgear.WithPrincipal(context.Background(), malformed)
+	// When it sends a gated stream message
+	conn := &fakeConn{procedure: procWatch, in: []string{orgA}}
+	err := g.Interceptor().WrapStreamingHandler(func(_ context.Context, c connect.StreamingHandlerConn) error {
+		return c.Receive(&scopeMsg{})
+	})(ctx, conn)
+	// Then it is refused
+	wantDenied(t, "malformed claim", err)
+}
+
+func TestNewGate_RefusesUnknownFeatures(t *testing.T) {
+	// Given gates on the zero value and on an undefined value
+	notFeatures := []flag{flagUnspecified, flag(99)}
+	for _, f := range notFeatures {
+		// When the gate is built
+		_, err := features.NewGate(newRegistry(t), map[string]flag{procSend: f}, scopeOf)
+		// Then it is refused
+		if err == nil {
+			t.Errorf("gate on %v accepted", f)
+		}
 	}
 }
 
-func TestGate_RefuseHook(t *testing.T) {
-	v := mustVerifier(t)
-	var gotScope string
-	var gotFeature flag
-	g := gate(t, features.GateConfig[flag]{
-		ScopeOf:   scopeOf,
-		Canonical: features.UUIDScope,
-		Refuse: func(_ context.Context, _ string, f flag, scope string) *connect.Error {
-			gotFeature, gotScope = f, scope
-			return connect.NewError(connect.CodeFailedPrecondition, errors.New("FEATURE_NOT_ENABLED"))
-		},
-	})
-	base := serve(t, connectgear.Bearer(v), g, &hasLog{})
-	err := call(base, procSend, mint(t, v, nil), "AAAAAAAA-1111-1111-1111-111111111111")
-	if connect.CodeOf(err) != connect.CodeFailedPrecondition {
-		t.Fatalf("err = %v, want the hook's error", err)
+func TestNewGate_RequiresRegistryAndScope(t *testing.T) {
+	// Given a gate missing its registry, and one missing scopeOf
+	// When they are built
+	_, noRegistry := features.NewGate[flag](nil, nil, scopeOf)
+	_, noScope := features.NewGate(newRegistry(t), nil, nil)
+	// Then both are refused
+	if noRegistry == nil || noScope == nil {
+		t.Fatalf("errs = %v, %v", noRegistry, noScope)
 	}
-	if gotFeature != flagSheets || gotScope != orgA {
-		t.Fatalf("hook saw %v %q", gotFeature, gotScope)
-	}
-	// The hook is only for "resolved off"; a missing scope is still refused plainly.
-	denied(t, "no scope", call(base, procSend, mint(t, v, nil), ""))
 }
 
-func mustVerifier(t *testing.T) *authjwt.Verifier {
-	t.Helper()
-	v, err := authjwt.NewVerifier(gateSecret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return v
-}
-
-// fakeConn is a handler stream whose Receive yields the queued scopes and
-// whose Send records.
+// fakeConn is a bidi handler stream whose Receive yields the queued scopes
+// and whose Send counts.
 type fakeConn struct {
 	connect.StreamingHandlerConn
 	procedure string
@@ -322,58 +234,61 @@ func (f *fakeConn) Receive(msg any) error {
 	if len(f.in) == 0 {
 		return errors.New("EOF")
 	}
-	msg.(*str).Value, f.in = f.in[0], f.in[1:]
+	msg.(*scopeMsg).Value, f.in = f.in[0], f.in[1:]
 	return nil
 }
 
 func (f *fakeConn) Send(any) error { f.sent++; return nil }
 
-// A bidi handler that sends before it receives, or after a refused message,
-// gets PermissionDenied; one whose message passed may send.
-func TestGate_BidiSendWaitsForACheckedMessage(t *testing.T) {
-	g := tenanted(t)
-	ctx := connectgear.WithPrincipal(context.Background(), &authjwt.Claims{
-		Subject: "u",
-		Raw:     claim(map[string]map[string]bool{orgA: {"FLAG_SHEETS": true}}),
+// runBidi runs body as the handler of a bidi stream on procedure receiving in.
+func runBidi(ctx context.Context, g *features.Gate[flag], procedure string, in []string, body func(connect.StreamingHandlerConn) error) (*fakeConn, error) {
+	conn := &fakeConn{procedure: procedure, in: in}
+	err := g.Interceptor().WrapStreamingHandler(func(_ context.Context, c connect.StreamingHandlerConn) error {
+		return body(c)
+	})(ctx, conn)
+	return conn, err
+}
+
+func TestGate_BidiSendsAfterAPassedMessage(t *testing.T) {
+	// Given a caller granted in orgA on a gated bidi stream
+	grantedInOrgA := connectgear.WithPrincipal(context.Background(), &authjwt.Claims{
+		Subject: "user-1",
+		Raw:     map[string]any{features.ClaimName: map[string]any{orgA: map[string]any{"FLAG_SHEETS": true}}},
 	})
-	run := func(ctx context.Context, proc string, in []string, body func(connect.StreamingHandlerConn) error) (*fakeConn, error) {
-		fc := &fakeConn{procedure: proc, in: in}
-		err := g.Interceptor().WrapStreamingHandler(func(_ context.Context, c connect.StreamingHandlerConn) error {
-			return body(c)
-		})(ctx, fc)
-		return fc, err
-	}
-
-	fc, err := run(ctx, procWatch, []string{orgA}, func(c connect.StreamingHandlerConn) error { return c.Send(&str{}) })
-	denied(t, "send before receive", err)
-	if fc.sent != 0 {
-		t.Fatal("message leaked before any check")
-	}
-
-	fc, _ = run(ctx, procWatch, []string{orgA, orgB}, func(c connect.StreamingHandlerConn) error {
-		if err := c.Receive(&str{}); err != nil {
+	// When the handler receives an orgA message, sends, then receives an orgB one
+	var secondReceive, sendAfterRefusal error
+	conn, err := runBidi(grantedInOrgA, newGate(t), procWatch, []string{orgA, orgB}, func(c connect.StreamingHandlerConn) error {
+		if err := c.Receive(&scopeMsg{}); err != nil {
 			return err
 		}
-		if err := c.Send(&str{}); err != nil {
+		if err := c.Send(&scopeMsg{}); err != nil {
 			return err
 		}
-		denied(t, "second message, other scope", c.Receive(&str{}))
-		denied(t, "send after a refused message", c.Send(&str{}))
+		secondReceive = c.Receive(&scopeMsg{})
+		sendAfterRefusal = c.Send(&scopeMsg{})
 		return nil
 	})
-	if fc.sent != 1 {
-		t.Fatalf("sent %d, want 1", fc.sent)
+	// Then only the send after the passed message goes out
+	if err != nil || conn.sent != 1 {
+		t.Fatalf("err = %v, sent %d; want one send", err, conn.sent)
 	}
+	wantDenied(t, "second message, other scope", secondReceive)
+	wantDenied(t, "send after a refused message", sendAfterRefusal)
+}
 
-	fc, err = run(ctx, procOpenStr, nil, func(c connect.StreamingHandlerConn) error { return c.Send(&str{}) })
-	if err != nil || fc.sent != 1 {
-		t.Fatalf("ungated stream send: %v, sent %d", err, fc.sent)
-	}
-
-	called := false
-	_, err = run(context.Background(), procWatch, []string{orgA}, func(connect.StreamingHandlerConn) error { called = true; return nil })
-	denied(t, "gated stream, unauthenticated", err)
-	if called {
-		t.Fatal("handler ran for an unauthenticated gated stream")
+func TestGate_BidiRefusesSendBeforeReceive(t *testing.T) {
+	// Given a caller granted in orgA on a gated bidi stream
+	grantedInOrgA := connectgear.WithPrincipal(context.Background(), &authjwt.Claims{
+		Subject: "user-1",
+		Raw:     map[string]any{features.ClaimName: map[string]any{orgA: map[string]any{"FLAG_SHEETS": true}}},
+	})
+	// When the handler sends before reading anything
+	conn, err := runBidi(grantedInOrgA, newGate(t), procWatch, []string{orgA}, func(c connect.StreamingHandlerConn) error {
+		return c.Send(&scopeMsg{})
+	})
+	// Then nothing leaks
+	wantDenied(t, "send before receive", err)
+	if conn.sent != 0 {
+		t.Fatal("message sent before any check")
 	}
 }
